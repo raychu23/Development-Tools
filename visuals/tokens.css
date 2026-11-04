@@ -1,0 +1,3 @@
+/* design tokens: GitHub Primer primitives, light + dark · see DESIGN.md */
+:root{--canvas:#ffffff;--surface:#f6f8fa;--border:#d0d7de;--text:#1f2328;--muted:#59636e;--accent:#0969da;--success:#1a7f37;--danger:#cf222e;--attention:#9a6700;--accent-bg:#ddf4ff;--success-bg:#dafbe1;--danger-bg:#ffebe9;--attention-bg:#fff8c5;--accent-fg:#0969da;--success-fg:#1a7f37}
+.dark{--canvas:#0d1117;--surface:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e;--accent:#2f81f7;--success:#3fb950;--danger:#f85149;--attention:#d29922;--accent-bg:#0c2d6b;--success-bg:#033a16;--danger-bg:#4c0f12;--attention-bg:#3d2e00;--accent-fg:#79c0ff;--success-fg:#7ee787}

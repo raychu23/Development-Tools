@@ -1,0 +1,38 @@
+<!doctype html><html><head><meta charset=utf-8><link rel="stylesheet" href="tokens.css"><style>
+*{box-sizing:border-box;margin:0}
+body{width:1600px;background:var(--canvas);color:var(--text);font:16px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;padding:32px}
+code{font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;font-size:13.5px;background:var(--canvas);border:1px solid var(--border);border-radius:4px;padding:1px 5px;white-space:nowrap}
+h1{font-size:22px;margin-bottom:4px}
+.sub{color:var(--muted);margin-bottom:20px;font-size:15px}
+.track{display:grid;grid-template-columns:repeat(7,1fr);gap:0;border:1.5px solid var(--border);border-radius:12px;overflow:hidden}
+.st{padding:16px 14px;border-right:1px solid var(--border);display:flex;flex-direction:column;gap:10px;position:relative}
+.st:last-child{border-right:0}
+.name{font-weight:700;font-size:17px;border-radius:6px;padding:6px 10px;background:var(--accent-bg);color:var(--accent-fg);display:inline-block;align-self:flex-start}
+.st.done .name{background:var(--success-bg);color:var(--success-fg)}
+.st.audit{background:var(--surface);border-left:1.5px dashed var(--border)}
+.st.hot{background:var(--surface)}
+.who{font-size:13px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.st ul{padding-left:16px;font-size:14.5px;display:flex;flex-direction:column;gap:6px}
+.gate{margin-top:auto;font-size:13.5px;border-left:3px solid var(--danger);background:var(--danger-bg);padding:5px 8px;border-radius:4px}
+.bottom{display:grid;grid-template-columns:1.1fr 1fr;gap:24px;margin-top:20px}
+.box{border:1.5px solid var(--border);border-radius:12px;padding:14px 16px;background:var(--surface);font-size:14.5px}
+.box h3{font-size:16px;margin-bottom:8px}
+.box ul{padding-left:16px;display:flex;flex-direction:column;gap:5px}
+.red{border-color:var(--danger)}
+</style></head><body class="THEME">
+<h1>What does "done" have to prove?</h1>
+<div class="sub">Every move is <code>ledger move &lt;task&gt; &lt;state&gt;</code> plus evidence flags. Missing evidence or a failing check means the move is refused.</div>
+<div class="track">
+  <div class="st"><span class="name">ready</span><span class="who">plan</span><ul><li>owner</li><li>done-when</li><li>checks to run</li><li>non-goals · stop rule</li></ul></div>
+  <div class="st"><span class="name">running</span><span class="who">claim</span><ul><li>own worktree + branch</li><li>base commit recorded</li></ul></div>
+  <div class="st hot"><span class="name">submitted</span><span class="who">builder</span><ul><li><code>--report</code> diff summary</li><li>ledger runs the checks in the worktree</li></ul><div class="gate">check fails → refused</div></div>
+  <div class="st hot"><span class="name">verified</span><span class="who">reviewer</span><ul><li><code>--reviewer</code> ≠ owner</li><li><code>--findings</code></li><li>checks rerun</li></ul><div class="gate">self-review → refused</div></div>
+  <div class="st hot"><span class="name">integrated</span><span class="who">merge</span><ul><li><code>--merge</code> commit</li><li>checks rerun on the combined repo</li></ul><div class="gate">check fails → refused</div></div>
+  <div class="st done"><span class="name">done</span><span class="who">close</span><ul><li><code>--outcome</code> where it lives</li><li><code>--prevents path:line</code>, the check that stops this mistake</li></ul></div>
+  <div class="st audit"><span class="name" style="background:var(--canvas);color:var(--muted);border:1px solid var(--border)">every move</span><span class="who">audit</span><ul><li>1 git commit</li><li>1 line in <code>4 log/ledger.md</code>, never deleted</li><li>board card after the commit</li></ul></div>
+</div>
+<div class="bottom">
+  <div class="box red"><h3>Off-ramps</h3><ul><li><b>blocked</b> or <b>failed</b> from running, submitted or verified: needs <code>--cause</code> + who decides</li><li>back to ready with <code>--note</code> · reviewer can send submitted back to running</li></ul></div>
+  <div class="box"><h3>If a move fails halfway</h3><ul><li>it undoes its own file edits, worktree and branch</li><li>the board card is only touched after the commit lands</li></ul></div>
+</div>
+</body></html>

@@ -1,0 +1,78 @@
+<!doctype html><html><head><meta charset=utf-8><link rel="stylesheet" href="tokens.css"><style>*{box-sizing:border-box;margin:0}
+body{width:1600px;background:var(--canvas);color:var(--text);font:16px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif;padding:32px}
+code,.mono{font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;font-size:14px}
+code{background:var(--canvas);border:1px solid var(--border);border-radius:4px;padding:1px 6px;white-space:nowrap}
+.top{display:grid;grid-template-columns:190px 40px 1fr 40px 190px;align-items:stretch}
+.end{border:1.5px solid var(--border);border-radius:12px;padding:20px 16px;display:flex;flex-direction:column;justify-content:center;gap:10px;background:var(--surface)}
+.end h3{font-size:20px}
+.chip{display:block;border:1px solid var(--border);border-radius:4px;padding:4px 8px;font-size:14px;background:var(--canvas)}
+.arrow{display:flex;align-items:center;justify-content:center;color:var(--accent);font-size:28px;font-weight:700}
+.panel{border:1.5px solid var(--accent);border-radius:12px;display:grid;grid-template-columns:repeat(4,1fr);overflow:hidden}
+.col{padding:20px 18px;border-right:1px solid var(--border);display:flex;flex-direction:column;gap:10px}
+.col:last-child{border-right:0}
+.col h2{font-size:20px;display:flex;align-items:center;gap:10px}
+.n{display:inline-flex;width:28px;height:28px;border-radius:50%;background:var(--accent);color:#fff;font-size:15px;align-items:center;justify-content:center;flex:none}
+.q{color:var(--muted);font-size:15px;font-style:italic}
+.col ul{padding-left:18px;display:flex;flex-direction:column;gap:7px;font-size:15px}
+.stop{border-left:3px solid var(--danger);background:var(--danger-bg);padding:6px 10px;border-radius:4px;font-size:14px}
+.rows{display:grid;grid-template-columns:1fr 1fr;gap:24px;margin-top:24px}
+.row{border:1.5px solid var(--border);border-radius:12px;padding:16px 18px;background:var(--surface)}
+.row h3{font-size:17px;margin-bottom:10px;display:flex;gap:8px;align-items:center}
+.dot{width:10px;height:10px;border-radius:50%;flex:none}
+.steps{display:flex;align-items:stretch;gap:8px;flex-wrap:nowrap;font-size:14px}
+.steps b.a{align-self:center}
+.steps span.s{border:1px solid var(--border);background:var(--canvas);border-radius:6px;padding:7px 10px;line-height:1.35;white-space:nowrap;display:flex;flex-direction:column;justify-content:center}
+.steps b.a{color:var(--muted);font-weight:400}
+.svc{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;font-size:14px}
+.svc div{border:1px solid var(--border);background:var(--canvas);border-radius:6px;padding:7px 9px;line-height:1.3}
+.svc .t{color:var(--muted);font-size:13px}
+.nums{display:grid;grid-template-columns:repeat(6,1fr);gap:0;margin-top:24px;border:1.5px solid var(--border);border-radius:12px;overflow:hidden}
+.nums div{padding:12px 14px;border-right:1px solid var(--border)}
+.nums div:last-child{border-right:0}
+.nums b{display:block;font-size:24px}
+.nums span{color:var(--muted);font-size:13px}
+</style></head><body class="THEME">
+<div class="top">
+  <div class="end"><h3>My request</h3><span class="q" style="font-style:normal">from any of 3 harnesses</span>
+    <span class="chip">Claude Code</span><span class="chip">Codex</span><span class="chip">Hermes desktop</span></div>
+  <div class="arrow">→</div>
+  <div class="panel">
+    <div class="col"><h2><span class="n">1</span>Route</h2><div class="q">which task is this?</div><ul>
+      <li>hook on session start runs <code>native_activation</code></li>
+      <li>binds the chat to 1 task folder + takes a 900 s writer lease</li>
+      <li>injects the boot packet: state, next step, my past corrections</li></ul></div>
+    <div class="col"><h2><span class="n">2</span>Work</h2><div class="q">with what context + limits?</div><ul>
+      <li>task files in git, <code>0 start</code> to <code>4 log</code></li>
+      <li>skills load on demand: 53 mine + 70+ curated</li>
+      <li><code>test-guard</code> checks every write / patch</li>
+      <li><code>agent_core</code> locks stop 2 agents editing the same thing</li></ul></div>
+    <div class="col"><h2><span class="n">3</span>Prove</h2><div class="q">is it actually done?</div><ul>
+      <li><code>ledger</code> moves the task through 9 states</li>
+      <li>the ledger runs the checks itself, not the agent</li>
+      <li>review by a different agent, then merge</li>
+      <li>1 git commit per move</li></ul>
+      <div class="stop">check fails → move refused</div></div>
+    <div class="col"><h2><span class="n">4</span>Remember</h2><div class="q">what does the next agent know?</div><ul>
+      <li>results + decisions routed into the task files</li>
+      <li>session end → chat archive, SQLite search</li>
+      <li>a generated doc page per task for me to read</li></ul></div>
+  </div>
+  <div class="arrow">→</div>
+  <div class="end" style="border-color:var(--success);background:var(--success-bg)"><h3>Verified work</h3>
+    <span style="font-size:15px">checks passed, reviewed, committed, and the next agent starts from it</span></div>
+</div>
+<div class="rows">
+  <div class="row"><h3><span class="dot" style="background:var(--danger)"></span>Gets better: a repeated mistake becomes a check</h3>
+    <div class="steps"><span class="s">I correct<br>an agent</span><b class="a">→</b><span class="s">logged<br>verbatim</span><b class="a">→</b><span class="s">1st time:<br>rule or skill</span><b class="a">→</b><span class="s">2nd time:<br>hook, lint or test</span><b class="a">→</b><span class="s"><code>done --prevents</code><span>must cite that check</span></span></div></div>
+  <div class="row"><h3><span class="dot" style="background:var(--attention)"></span>Runs without me: launchd services</h3>
+    <div class="svc"><div>second-brain<br><span class="t">links → classify → route, daily</span></div><div>ML experiment queue<br><span class="t">1 job at a time, survives reboots</span></div><div>file-org watcher<br><span class="t">inventory on add / delete</span></div><div>ai-memory<br><span class="t">cross-session recall</span></div></div></div>
+</div>
+<div class="nums">
+  <div><b>1,087</b><span>commits in 4 weeks</span></div>
+  <div><b>304</b><span>tests passing</span></div>
+  <div><b>28</b><span>hook points, 3 harnesses</span></div>
+  <div><b>7,165</b><span>agent sessions logged</span></div>
+  <div><b>767</b><span>chats archived + searchable</span></div>
+  <div><b>13%</b><span>rework rate, 30 days</span></div>
+</div>
+</body></html>
