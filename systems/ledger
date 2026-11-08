@@ -1,0 +1,650 @@
+#!/usr/bin/env python3
+"""ledger: raymond's code-task ledger (rules.md §3 code features · Project/sdlc/3-process/3-agent-workflows)
+
+1 task = 1 folder T<n>-<name>/ with a 0 start.md packet + frontmatter state      every transition needs its evidence,
+is appended to 4 log/ledger.md (nothing deleted) and makes 1 git commit (via ctx)      orca gets the matching card status
+
+    new      <project dir> <name> --goal G --done-when D [--owner O] [--repo R] [--mode M] [--boundary B] [--checks C]
+             [--non-goals N] [--proof P] [--stop S]
+    move     <task> <state> [evidence flags]      proposed → ready → running → submitted → verified → integrated → done
+                                                  running|submitted|verified → blocked|failed      blocked|failed → ready      submitted → running (changes requested)
+    show     <task>                               packet + ledger log
+    board    [scope] [--json]                     every ledger task: state · owner · updated · next
+    ready    [scope]                              tasks waiting for a worker (state ready)
+
+evidence per move (rules from 3-agent-workflows/0-start.md):
+    ready        owner + done-when + boundary + checks + non-goals + proof + stop rows filled      (the same flags fill them here)
+                 only proposed → ready      blocked|failed → ready needs --note only (old tasks never strand)
+    running      --worktree PATH | --git-worktree | --orca (orca worktree create)      records base commit, branch, claim
+    submitted    --report "diff summary" [--risks]      the ledger runs the checks row in the worktree, a failure refuses the move
+    verified     --reviewer R (not the owner) --findings F      checks row reruns in the worktree
+    integrated   --merge "commit or branch"      checks row reruns in the repo (combined revision)
+    done         --outcome "where it lives" --resources retain|archive|cleanup --prevents "path[:line] [label]" | "none: <reason>"
+                 path = the artifact that now prevents the logged mistake, must exist (repo, else ledger root)
+                 none: refused when 4 log/ledger.md shows → blocked, → failed or submitted → running (changes requested)
+    blocked / failed   --cause C --decision-owner D      back to ready / running: --note N
+
+orca: on every move the card gets --workspace-status + --comment (todo · in-progress · in-review · completed)      no orca on PATH → the command is printed
+global: --root DIR · --no-commit · --no-orca · --include-dirty      env LEDGER_ORCA=0 turns orca off
+safety: a failed move undoes its own file edits, the worktree / branch it created and never updates the orca card (cards only after the commit)
+"""
+import argparse
+import datetime as dt
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import time
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+_spec = importlib.util.spec_from_loader('ctx', importlib.machinery.SourceFileLoader('ctx', os.path.join(HERE, 'ctx')))
+ctx = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(ctx)
+
+STATES = ['proposed', 'ready', 'running', 'submitted', 'verified', 'integrated', 'done', 'blocked', 'failed']
+FLOW = {
+    ('proposed', 'ready'), ('ready', 'running'), ('running', 'submitted'), ('submitted', 'verified'),
+    ('verified', 'integrated'), ('integrated', 'done'), ('submitted', 'running'),
+    ('blocked', 'ready'), ('failed', 'ready'),
+}
+for s in ('running', 'submitted', 'verified'):
+    FLOW |= {(s, 'blocked'), (s, 'failed')}
+ORCA_STATUS = {'proposed': 'todo', 'ready': 'todo', 'running': 'in-progress', 'submitted': 'in-review',
+               'verified': 'in-review', 'integrated': 'completed', 'done': 'completed', 'blocked': 'in-progress', 'failed': 'todo'}
+NEXT = {
+    'proposed': 'fill owner + done-when + boundary + checks + non-goals + proof + stop → ledger move <task> ready',
+    'ready': 'worker claims it → ledger move <task> running --orca | --git-worktree | --worktree PATH',
+    'running': 'worker finishes → ledger move <task> submitted --report … (ledger runs the checks row)',
+    'submitted': 'fresh reviewer → ledger move <task> verified --reviewer … --findings …',
+    'verified': 'merge → ledger move <task> integrated --merge … (ledger reruns checks in the repo)',
+    'integrated': 'record outcome → ledger move <task> done --outcome … --resources … --prevents …',
+    'done': '—',
+    'blocked': 'decision owner unblocks → ledger move <task> ready --note …',
+    'failed': 'retry or drop → ledger move <task> ready --note …',
+}
+PLACEHOLDER = re.compile(r'^(|<.*>|—|-|tbd|todo)$', re.I)
+BRIEF = ('done-when', 'boundary', 'checks', 'non-goals', 'proof', 'stop')  # rows a proposed task needs before ready
+GAP = ctx.GAP
+
+
+class LedgerError(ctx.CtxError):
+    pass
+
+
+class Run:
+    """side effects outside the files: undone on failure (cleanup), or run only after the commit (post)"""
+    def __init__(self):
+        self.cleanup = []  # callables, newest first on undo
+        self.post = []     # callables after a successful commit
+        self.dirs = []     # folders this action created (removed on undo if still empty)
+
+    def undo(self):
+        left = []
+        for fn in reversed(self.cleanup):
+            try:
+                fn()
+            except Exception as e:  # keep undoing the rest
+                left.append(str(e))
+        for d in reversed(self.dirs):
+            try:
+                os.removedirs(d) if os.path.isdir(d) and not os.listdir(d) else None
+            except OSError:
+                pass
+        return left
+
+
+def now():
+    return dt.datetime.now().strftime('%Y-%m-%d %H:%M')
+
+
+def row(cue, value=''):
+    return f'    {cue:<24}{value}'.rstrip()
+
+
+def packet_rows(text):
+    """cue → value for the top-level rows of the first notes packet (continuation lines joined)"""
+    out, cur = {}, None
+    for line in ctx.packet_lines(text):
+        if line.startswith('    ') and not line.startswith('     ') and line.strip():
+            parts = re.split(r'\s{2,}', line.strip(), maxsplit=1)
+            cur = parts[0]
+            out[cur] = parts[1] if len(parts) > 1 else ''
+        elif cur and line.startswith('        '):
+            out[cur] = (out[cur] + ' ' + line.strip()).strip()
+    return out
+
+
+def set_row(text, cue, value):
+    """replace the value of a top-level packet row (its continuation lines too), keep everything else"""
+    value = ctx.clean(value)
+    m = ctx.FENCE.search(text)
+    if not m:
+        raise LedgerError('no ```notes packet in 0 start.md')
+    lines = m.group(1).split('\n')
+    out, i, done = [], 0, False
+    while i < len(lines):
+        line = lines[i]
+        parts = re.split(r'\s{2,}', line.strip(), maxsplit=1) if line.startswith('    ') and not line.startswith('     ') else None
+        if parts and parts[0] == cue and not done:
+            out.append(row(cue, value))
+            i += 1
+            while i < len(lines) and lines[i].startswith('        ') and lines[i].strip():
+                i += 1
+            done = True
+            continue
+        out.append(line)
+        i += 1
+    if not done:
+        k = next((j for j, ln in enumerate(out) if re.match(r'^    (came from|links|harness)(\s|$)', ln)), len(out))
+        while k > 0 and not out[k - 1].strip():
+            k -= 1
+        out.insert(k, row(cue, value))
+    return text[:m.start(1)] + '\n'.join(out) + text[m.end(1):]
+
+
+def task_dir(root, p):
+    d = ctx.resolve(root, p)
+    if os.path.isfile(d):
+        d = os.path.dirname(d)
+    f = os.path.join(d, '0 start.md')
+    if not os.path.isfile(f):
+        raise LedgerError(f'not a task folder (no 0 start.md): {ctx.rel(root, d)}')
+    if not ctx.fm_get(ctx.read(f), 'state'):
+        raise LedgerError(f'not a ledger task (no state: in frontmatter): {ctx.rel(root, d)}')
+    return d
+
+
+def next_number(project):
+    nums = [int(m.group(1)) for n in os.listdir(project) if (m := re.match(r'^T(\d+)-', n))]
+    return max(nums, default=0) + 1
+
+
+def slug(name):
+    s = re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')
+    if not s:
+        raise LedgerError('empty task name')
+    return s
+
+
+def git_out(repo, *args):
+    r = subprocess.run(['git', '-C', repo] + list(args), capture_output=True, text=True)
+    if r.returncode:
+        raise LedgerError(f'git {" ".join(args[:2])} in {repo}: {(r.stderr or r.stdout).strip()}')
+    return r.stdout.strip()
+
+
+# ---------- orca ----------
+
+def orca_on(args):
+    return not args.no_orca and os.environ.get('LEDGER_ORCA', '1') != '0'
+
+
+def git_ok(repo, *args):
+    return subprocess.run(['git', '-C', repo] + list(args), capture_output=True, text=True).returncode == 0
+
+
+def orca_run(cmd, args, notes):
+    """run orca if it is on PATH, else print the command for raymond / an agent on the mac"""
+    if not orca_on(args):
+        return None
+    exe = shutil.which('orca')
+    shown = shlex.join(cmd)
+    if not exe:
+        notes.append('orca not on PATH here, run on the mac: ' + shown)
+        return None
+    r = subprocess.run([exe] + cmd[1:], capture_output=True, text=True)
+    if r.returncode:
+        notes.append(f'orca failed ({r.returncode}): {shown}: {(r.stderr or r.stdout).strip()[:200]}')
+        return None
+    notes.append('orca: ' + shown)
+    try:
+        return json.loads(r.stdout)
+    except ValueError:
+        return {}
+
+
+def find_path(obj):
+    """the worktree path inside orca's json (key names not documented: search path-like keys)"""
+    if isinstance(obj, dict):
+        for k in ('path', 'worktreePath', 'worktree_path', 'dir', 'cwd'):
+            v = obj.get(k)
+            if isinstance(v, str) and v.startswith('/'):
+                return v
+        for v in obj.values():
+            p = find_path(v)
+            if p:
+                return p
+    if isinstance(obj, list):
+        for v in obj:
+            p = find_path(v)
+            if p:
+                return p
+    return None
+
+
+def orca_card(fm, state, short, args, notes):
+    wt = fm.get('worktree')
+    if not wt:
+        return None
+    return lambda: orca_run(['orca', 'worktree', 'set', '--worktree', f'path:{wt}', '--comment', f'{state}: {short}'[:300],
+              '--workspace-status', ORCA_STATUS[state], '--json'], args, notes)
+
+
+# ---------- actions ----------
+
+def new_task(L, root, a, run):
+    project = ctx.resolve(root, a.project)
+    if not os.path.isdir(project):
+        raise LedgerError(f'no such project folder: {ctx.rel(root, project)}')
+    typed = re.sub(r'^T[0-9]+-', '', a.name) if re.match(r'^T[0-9]+-\S', a.name) else a.name  # a typed T<n>- prefix is not doubled
+    name = f'T{next_number(project)}-{slug(typed)}'
+    d = os.path.join(project, name)
+    if os.path.exists(d):
+        raise LedgerError(f'already exists: {ctx.rel(root, d)}')
+    run.dirs += [d, os.path.join(d, '4 log')]
+    fm = {'state': 'proposed', 'owner': a.owner or '', 'repo': os.path.abspath(a.repo) if a.repo else '', 'branch': '', 'worktree': '',
+          'base': '', 'reviewer': '', 'updated': now(), 'status': 'ledger proposed', 'next': NEXT['proposed']}
+    body = '\n'.join([
+        '```notes',
+        f'{name}      ledger task (rules.md §3 code features)      project {os.path.basename(project)}',
+        row('goal', a.goal), row('done-when', a.done_when),
+        row('status', f'{now()[:10]} proposed'), row('next', NEXT['proposed']),
+        row('pinned'),
+        row('mode', a.mode or 'one worker'), row('boundary', a.boundary or ''), row('checks', a.checks or ''),
+        row('non-goals', a.non_goals or ''), row('proof', a.proof or ''), row('stop', a.stop or ''),
+        row('came from', a.came_from or ''), row('links', '4 log/ledger.md (every transition + its evidence)'),
+        row('harness', a.harness or ''),
+        '```', ''])
+    text = ctx.fm_set('---\n---\n' + body, **fm)
+    f = os.path.join(d, '0 start.md')
+    L.edit(f, text)
+    L.log_append(d, 'ledger.md', 'ledger (newest last, nothing deleted)', f'    {now()}      new → proposed      {ctx.clean(a.goal)[:160]}')
+    return d, f'{ctx.rel(root, d)} proposed'
+
+
+def need(a, *flags):
+    miss = [f'--{f.replace("_", "-")}' for f in flags if not (getattr(a, f, None) or '').strip()]
+    if miss:
+        raise LedgerError('missing evidence: ' + ' '.join(miss))
+
+
+def managed_gate(root, d, to):
+    managed = os.path.join(d, 'systems', 'task.json')
+    if os.path.isfile(managed) and to in ('verified', 'integrated', 'done'):
+        from agent_core import Store, file_hash
+        store = Store(root, commit=False)
+        contract = store.contract(d)
+        reports = store._list(d, 'acceptances')
+        current = [record for record in reports if not record.get('stale')
+                   and record['requirement_rev'] == contract['requirement_rev']
+                   and all(file_hash(store.path(path)) == digest for path, digest in record['artifacts'].items())]
+        if contract.get('state') != 'complete' or not current:
+            raise LedgerError('managed task requires current criterion acceptance before ledger verification or completion')
+
+
+CHECKED = {'submitted': 'checks', 'verified': 'checks', 'integrated': 'combined checks'}
+
+
+def first_segment(value):
+    """the row value before its notes (ctx row_value: notes follow a 6+ space gap)"""
+    return re.split(r' {6,}', value.strip())[0].strip()
+
+
+def env_number(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        raise LedgerError(f'{name} must be a number of seconds/hours, got {os.environ[name]!r}')
+
+
+def run_checks(root, a):
+    """Run the packet's checks row before the ledger lock: done is gated by code, not a typed claim.
+
+    submitted / verified run in the task worktree (refused if it is missing), integrated runs in the
+    repo (the combined revision). An illegal transition or missing evidence flag is refused first."""
+    d = task_dir(root, a.task)
+    managed_gate(root, d, a.state)  # cheaper refusal first
+    text = ctx.read(os.path.join(d, '0 start.md'))
+    fm = ctx.fm_items(text)
+    if (fm.get('state'), a.state) not in FLOW:
+        return None  # move() reports the exact illegal transition, no check is spent on it
+    need(a, *{'submitted': ('report',), 'verified': ('reviewer', 'findings'), 'integrated': ('merge',)}[a.state])
+    if a.state == 'verified' and a.reviewer.strip() == fm.get('owner', '').strip():
+        raise LedgerError('reviewer must be a fresh context, not the owner')
+    command = first_segment(packet_rows(text).get('checks', ''))
+    if PLACEHOLDER.match(command):
+        raise LedgerError('checks row is empty: write a runnable checks command in 0 start.md before moving to ' + a.state)
+    if re.search(r'<[A-Za-z_][A-Za-z0-9_-]*>', command):  # <worktree>, <task dir> style, not shell redirects like <in.txt
+        raise LedgerError(f'checks row still has a placeholder: {command}      write the real path or command')
+    cwd = fm.get('repo', '') if a.state == 'integrated' else fm.get('worktree', '')
+    if not cwd or not os.path.isdir(cwd):
+        raise LedgerError(f'{"repo" if a.state == "integrated" else "task worktree"} missing: {cwd or "(not set)"}      '
+                          'checks must run there, never silently somewhere else')
+    try:
+        r = subprocess.run(command, shell=True, cwd=cwd, capture_output=True, text=True, encoding='utf-8', errors='replace',
+                           timeout=env_number('LEDGER_CHECKS_TIMEOUT', 3600))
+        code, out = r.returncode, (r.stdout + r.stderr).strip()
+    except subprocess.TimeoutExpired as e:
+        partial = e.stdout or b''
+        code, out = 'timeout', (partial.decode('utf-8', 'replace') if isinstance(partial, bytes) else partial).strip()
+    tail = ctx.clean(out.splitlines()[-1] if out else '')[:100]
+    if code != 0:
+        raise LedgerError(f'{CHECKED[a.state]} failed: {command} → exit {code} in {cwd}\n' + out[-2000:])
+    return {'label': CHECKED[a.state], 'command': command, 'cwd': cwd, 'tail': tail}
+
+
+MISTAKE = re.compile(r'^\s+\d{4}-\d\d-\d\d \d\d:\d\d {6}(\w+) → (\w+)(?: {6}|$)')
+
+
+def mistakes(d):
+    """logged transitions that mean something went wrong: → blocked · → failed · submitted → running (changes requested)"""
+    lg = os.path.join(d, '4 log', 'ledger.md')
+    out = []
+    for line in (ctx.read(lg).splitlines() if os.path.exists(lg) else []):
+        m = MISTAKE.match(line)
+        if m and (m.group(2) in ('blocked', 'failed') or m.groups()[:2] == ('submitted', 'running')):
+            out.append(f'{m.group(1)} → {m.group(2)}')
+    return out
+
+
+def artifact(value, bases):
+    """'path[:line] [label]' → (shown ref, label)      longest leading words that name an existing path (paths may hold spaces)"""
+    words = value.split()
+    for k in range(len(words), 0, -1):
+        ref, label = ' '.join(words[:k]), ' '.join(words[k:])
+        m = re.match(r'^(.*?)(?::(\d+))?$', ref)
+        path, line = m.group(1), m.group(2)
+        for b in bases:
+            full = path if os.path.isabs(path) else os.path.join(b, path)
+            if path and os.path.exists(full):
+                if line:
+                    n = len(ctx.read(full).splitlines()) if os.path.isfile(full) else 0
+                    if not 1 <= int(line) <= n:
+                        raise LedgerError(f'--prevents {ref}: line {line} not in {full} ({n} lines)')
+                return ref, label
+    raise LedgerError(f'--prevents names no existing artifact: {value}      looked in ' + ' · '.join(bases)
+                      + '      give path[:line] relative to the repo (or ledger root), or none: <reason>')
+
+
+def move(L, root, a, run):
+    d = task_dir(root, a.task)
+    f = os.path.join(d, '0 start.md')
+    text = ctx.read(f)
+    fm = ctx.fm_items(text)
+    cur, to = fm.get('state'), a.state
+    if to not in STATES:
+        raise LedgerError(f'unknown state {to}      one of {" ".join(STATES)}')
+    if (cur, to) not in FLOW:
+        allowed = sorted(t for s, t in FLOW if s == cur)
+        raise LedgerError(f'{cur} → {to} not allowed      from {cur}: {" ".join(allowed) or "nothing (final)"}')
+    managed_gate(root, d, to)
+    if to in CHECKED and not getattr(a, 'ran', None):
+        raise LedgerError(f'state changed while checks ran (now {cur})      rerun the move')
+    rows = packet_rows(text)
+    upd, ev, notes, extra = {}, [], [], []
+    if to == 'ready':
+        for cue in BRIEF:
+            val = getattr(a, cue.replace('-', '_'), None)
+            if val:
+                text = set_row(text, cue, val)
+        rows = packet_rows(text)
+    if to == 'ready' and cur == 'proposed':
+        owner = a.owner or fm.get('owner', '')
+        bad = [c for c in BRIEF if PLACEHOLDER.match(rows.get(c, '').strip())]
+        if not owner:
+            bad.insert(0, 'owner (--owner)')
+        if bad:
+            raise LedgerError('not ready, fill first: ' + ' · '.join(bad))
+        upd['owner'] = owner
+        ev.append(f'owner {owner}')
+    elif to == 'ready':
+        need(a, 'note')
+        ev.append(a.note)
+    elif to == 'running':
+        if cur == 'submitted':
+            need(a, 'findings')
+            ev.append('changes requested: ' + a.findings)
+        else:
+            repo = os.path.abspath(a.repo) if a.repo else fm.get('repo', '')
+            branch = a.branch or fm.get('branch') or f'ledger/{os.path.basename(d).lower()}'
+            wt = os.path.abspath(a.worktree) if a.worktree else ''
+            old_wt = fm.get('worktree', '')
+            if not wt and old_wt and os.path.isdir(old_wt):
+                wt = old_wt  # retry after blocked / failed: reuse the workspace it already has
+                notes.append(f'reusing worktree {wt}')
+            elif not wt and a.orca:
+                if not orca_on(a):
+                    raise LedgerError('--orca but orca is turned off (--no-orca or LEDGER_ORCA=0)')
+                sel = a.orca_repo or fm.get('orca_repo', '')
+                if not sel:
+                    raise LedgerError('--orca needs --orca-repo id:<repoId> (orca worktree ps --json shows ids)')
+                out = orca_run(['orca', 'worktree', 'create', '--repo', sel, '--name', os.path.basename(d), '--json'], a, notes)
+                wt = find_path(out)
+                upd['orca_repo'] = sel
+                if not wt:
+                    raise LedgerError('orca did not report a worktree path      rerun with --worktree PATH\n' + '\n'.join(notes))
+                run.cleanup.append(lambda w=wt: orca_run(['orca', 'worktree', 'rm', '--worktree', f'path:{w}', '--force', '--json'], a, notes))
+            elif not wt and a.git_worktree:
+                if not repo or not os.path.isdir(repo):
+                    raise LedgerError('--git-worktree needs --repo PATH (or repo: in frontmatter)')
+                wt = os.path.join(os.path.dirname(repo), os.path.basename(repo) + '-worktrees', os.path.basename(d))
+                if git_ok(repo, 'rev-parse', '--verify', '--quiet', 'refs/heads/' + branch):
+                    git_out(repo, 'worktree', 'add', wt, branch)
+                    run.cleanup.append(lambda: git_out(repo, 'worktree', 'remove', '--force', wt))
+                else:
+                    git_out(repo, 'worktree', 'add', '-b', branch, wt)
+                    run.cleanup.append(lambda: git_out(repo, 'branch', '-D', branch))
+                    run.cleanup.append(lambda: git_out(repo, 'worktree', 'remove', '--force', wt))
+            if not wt:
+                raise LedgerError('claim needs a workspace: --worktree PATH | --git-worktree | --orca')
+            base = ''
+            if os.path.isdir(wt):
+                try:
+                    base = git_out(wt, 'rev-parse', '--short', 'HEAD')
+                except LedgerError:
+                    notes.append(f'base commit unknown: {wt} is not a git checkout yet')
+            else:
+                notes.append(f'base commit unknown: {wt} is not on this machine')
+            upd.update(worktree=wt, branch=branch, base=base, repo=repo, claimed=now())
+            ev.append(f'worktree {wt} · branch {branch} · base {base or "?"}')
+    elif to == 'submitted':
+        need(a, 'report')
+        ev += [f'report: {a.report}', f'{a.ran["label"]} exit 0'] + ([f'note: {a.checks_result}'] if a.checks_result else []) + ([f'risks: {a.risks}'] if a.risks else [])
+    elif to == 'verified':
+        need(a, 'reviewer', 'findings')
+        if a.reviewer.strip() == fm.get('owner', '').strip():
+            raise LedgerError('reviewer must be a fresh context, not the owner')
+        upd['reviewer'] = a.reviewer
+        ev += [f'reviewer {a.reviewer}', f'findings: {a.findings}', f'{a.ran["label"]} exit 0'] + ([f'note: {a.checks_result}'] if a.checks_result else [])
+    elif to == 'integrated':
+        need(a, 'merge')
+        ev += [f'merge {a.merge}', f'{a.ran["label"]} exit 0'] + ([f'note: {a.checks_result}'] if a.checks_result else [])
+    elif to == 'done':
+        need(a, 'outcome', 'resources')
+        if a.resources not in ('retain', 'archive', 'cleanup'):
+            raise LedgerError('--resources retain | archive | cleanup')
+        need(a, 'prevents')
+        value = ctx.clean(a.prevents)
+        if re.match(r'^none\s*:', value, re.I):
+            if not value.split(':', 1)[1].strip():
+                raise LedgerError('--prevents none: needs a reason')
+            seen = mistakes(d)
+            if seen:
+                raise LedgerError('--prevents none: refused, the log shows a mistake (' + ' · '.join(dict.fromkeys(seen))
+                                  + ')      name the artifact that now prevents it: path[:line] [label]')
+        else:
+            bases = [b for b in dict.fromkeys([fm.get('repo', ''), root]) if b and os.path.isdir(b)]
+            artifact(value, bases)
+        stamp = f'[source: {ctx.rel(root, d)}; added: {now()[:10]}]'  # the rule's back-link, rules carry source + date (B2)
+        text = set_row(text, 'prevents', value)
+        ev += [f'outcome: {a.outcome}', f'resources: {a.resources}', f'prevents: {value}']
+        extra.append(f'    {now()}      prevents: {value} ' + stamp)
+        if not value.lower().startswith('none'):
+            notes.append('stamp the artifact with: ' + stamp)
+    elif to in ('blocked', 'failed'):
+        need(a, 'cause', 'decision_owner')
+        ev += [f'cause: {a.cause}', f'decides: {a.decision_owner}']
+    short = ctx.clean(' · '.join(ev))[:220]
+    upd.update(state=to, updated=now(), status=f'ledger {to}', next=NEXT[to])
+    text = ctx.fm_set(text, **upd)
+    text = set_row(text, 'status', f'{now()[:10]} {to}{GAP}{short[:120]}')
+    text = set_row(text, 'next', NEXT[to])
+    L.edit(f, text)
+    L.log_append(d, 'ledger.md', 'ledger (newest last, nothing deleted)', f'    {now()}      {cur} → {to}      {short}')
+    for line in extra:  # unclipped, the stamp keeps its ; (B2 format)
+        L.log_append(d, 'ledger.md', 'ledger (newest last, nothing deleted)', line)
+    if getattr(a, 'ran', None):
+        r = a.ran
+        L.log_append(d, 'ledger.md', 'ledger (newest last, nothing deleted)',
+                     '    ' + ctx.clean(f'{now()}      {r["label"]} ran: {r["command"]} in {r["cwd"]} → exit 0' + (f' ({r["tail"]})' if r['tail'] else '')))
+    card = orca_card(ctx.fm_items(text), to, short, a, notes)
+    if card:
+        run.post.append(card)
+    return d, f'{ctx.rel(root, d)} {cur} → {to}', notes
+
+
+LIVE = ('running', 'submitted', 'verified', 'integrated')
+
+
+def claims(boundary):
+    out = []
+    for p in re.split(r'[,·;]', first_segment(boundary)):
+        p = re.sub(r'(/\*\*?)+$', '', p.strip().strip('`').strip())
+        p = re.sub(r'^\./', '', p).strip('/')
+        if p and not PLACEHOLDER.match(p):
+            out.append(p)
+    return out
+
+
+def overlapping(a, b):
+    return any(x == y or x.startswith(y + '/') or y.startswith(x + '/') for x in a for y in b)
+
+
+def flag(rows):
+    """stalled: live task untouched for LEDGER_STALE_HOURS (24) · overlap: 2 live tasks claim the same paths"""
+    stale = env_number('LEDGER_STALE_HOURS', 24) * 3600
+    for r in rows:
+        r['flags'] = []
+        if r['state'] in LIVE:
+            try:
+                age = time.time() - time.mktime(time.strptime(r['updated'][:16], '%Y-%m-%d %H:%M'))
+            except ValueError:
+                age = 0
+            if age > stale:
+                r['flags'].append('stalled')
+            r['flags'] += [f"overlap {o['task']}" for o in rows if o is not r and o['state'] in LIVE
+                           and overlapping(r['claims'], o['claims'])]
+    return rows
+
+
+def scan(root, scope):
+    rows = []
+    for cur, dirs, files in os.walk(scope):
+        dirs[:] = [x for x in dirs if x not in ctx.PRUNE and not x.startswith('.')]
+        if '0 start.md' in files:
+            try:
+                t = ctx.read(os.path.join(cur, '0 start.md'))
+            except (OSError, UnicodeDecodeError):
+                continue  # an unreadable packet (bad bytes, dangling link, no permission) never breaks the board
+            fm = ctx.fm_items(t)
+            if fm.get('state') in STATES:
+                try:
+                    boundary = packet_rows(t).get('boundary', '')
+                except ctx.CtxError:
+                    boundary = ''  # a packet without a notes block still lists, with no claim
+                rows.append({'task': ctx.rel(root, cur), 'state': fm['state'], 'owner': fm.get('owner', ''),
+                             'updated': fm.get('updated', ''), 'branch': fm.get('branch', ''), 'next': fm.get('next', ''),
+                             'claims': claims(boundary)})
+    order = {s: i for i, s in enumerate(['blocked', 'running', 'submitted', 'verified', 'integrated', 'ready', 'proposed', 'failed', 'done'])}
+    return sorted(flag(rows), key=lambda r: (order[r['state']], r['task']))
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog='ledger', description='code-task ledger: files + git, nothing deleted, orca cards synced')
+    ap.add_argument('--root')
+    ap.add_argument('--no-commit', action='store_true')
+    ap.add_argument('--no-orca', action='store_true')
+    ap.add_argument('--include-dirty', action='store_true', help='allow editing a 0 start.md that has uncommitted hand edits (they go into the same commit)')
+    sp = ap.add_subparsers(dest='cmd', required=True)
+    s = sp.add_parser('new')
+    s.add_argument('project')
+    s.add_argument('name')
+    s.add_argument('--goal', required=True)
+    s.add_argument('--done-when', required=True)
+    for k in ('owner', 'repo', 'mode', 'boundary', 'checks', 'non-goals', 'proof', 'stop', 'came-from', 'harness'):
+        s.add_argument('--' + k)
+    s = sp.add_parser('move')
+    s.add_argument('task')
+    s.add_argument('state')
+    for k in ('owner', 'repo', 'branch', 'worktree', 'orca-repo', 'done-when', 'boundary', 'checks', 'non-goals', 'proof', 'stop', 'report',
+              'checks-result', 'risks', 'reviewer', 'findings', 'merge', 'outcome', 'resources', 'prevents', 'cause', 'decision-owner', 'note'):
+        s.add_argument('--' + k)
+    s.add_argument('--orca', action='store_true')
+    s.add_argument('--git-worktree', action='store_true')
+    s = sp.add_parser('show')
+    s.add_argument('task')
+    for c in ('board', 'ready'):
+        s = sp.add_parser(c)
+        s.add_argument('scope', nargs='?', default='.')
+        s.add_argument('--json', action='store_true')
+    a = ap.parse_args(argv)
+    root = ctx.find_root(a.root)
+    try:
+        if a.cmd in ('board', 'ready'):
+            rows = scan(root, ctx.resolve(root, a.scope))
+            if a.cmd == 'ready':
+                rows = [r for r in rows if r['state'] == 'ready']
+            if a.json:
+                print(json.dumps(rows, ensure_ascii=False))
+                return 0
+            if not rows:
+                print('no ledger tasks' + (' in state ready' if a.cmd == 'ready' else ''))
+                return 0
+            w = max(len(r['task']) for r in rows)
+            print(f"{'task':<{w}}  {'state':<11}{'owner':<14}{'updated':<18}next")
+            for r in rows:
+                print(f"{r['task']:<{w}}  {r['state']:<11}{r['owner'][:13]:<14}{r['updated']:<18}{r['next'][:70]}")
+                for f in r['flags']:
+                    print(f"{'':<{w}}  ! {f}")
+            return 0
+        if a.cmd == 'show':
+            d = task_dir(root, a.task)
+            sys.stdout.write(ctx.read(os.path.join(d, '0 start.md')))
+            lg = os.path.join(d, '4 log', 'ledger.md')
+            if os.path.exists(lg):
+                sys.stdout.write('\n' + ctx.read(lg))
+            return 0
+        a.ran = run_checks(root, a) if a.cmd == 'move' and a.state in CHECKED else None
+        L = ctx.Ctx(root, commit=not a.no_commit, include_dirty=a.include_dirty)
+        notes, run = [], Run()
+        with ctx.flock(ctx.lock_path(root)):
+            try:
+                if a.cmd == 'new':
+                    d, msg = new_task(L, root, a, run)
+                else:
+                    d, msg, notes = move(L, root, a, run)
+                h = L.commit(f'ledger {a.cmd}: {msg}')
+            except Exception:
+                left = L.rollback() + run.undo()
+                if left:
+                    print('ledger: rollback left: ' + ' | '.join(left), file=sys.stderr)
+                raise
+        for fn in run.post:
+            fn()
+        print(msg)
+        for n in notes:
+            print(n)
+        print(f'commit {h}' if h else ('no commit (--no-commit or not a git repo)' if not L.commit_on else 'no change'))
+        return 0
+    except ctx.CtxError as e:
+        print(f'ledger: {e}', file=sys.stderr)
+        return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -1,0 +1,74 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$WORKSPACE/systems/ctx-hook\" --native --root \"$WORKSPACE\" --harness claude-code session-start"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$WORKSPACE/systems/ctx-hook\" --native --root \"$WORKSPACE\" --harness claude-code prompt"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$WORKSPACE/systems/ctx-hook\" --native --root \"$WORKSPACE\" --harness claude-code pre-tool"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$WORKSPACE/systems/ctx-hook\" --native --root \"$WORKSPACE\" --harness claude-code post-tool"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$WORKSPACE/systems/ctx-hook\" --native --root \"$WORKSPACE\" --harness claude-code pre-compact"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$WORKSPACE/systems/ctx-hook\" --native --root \"$WORKSPACE\" --harness claude-code stop"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$WORKSPACE/systems/ctx-hook\" --native --root \"$WORKSPACE\" --harness claude-code session-end"
+          }
+        ]
+      }
+    ]
+  }
+}

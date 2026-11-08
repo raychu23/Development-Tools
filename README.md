@@ -1,5 +1,7 @@
 # Development-Tools
 
+[![tests](https://github.com/raychu23/Development-Tools/actions/workflows/tests.yml/badge.svg)](https://github.com/raychu23/Development-Tools/actions/workflows/tests.yml)
+
 **The system I built to run AI coding agents like a small engineering org.** Three agent harnesses share one set of context, skills, guardrails and task state. Hooks route every session to the right task. A state machine gates every code change, and background services keep memory, data and ML experiments running when I'm away.
 
 ```
@@ -12,8 +14,8 @@
 ## 1 How it works
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="visuals/overview-dark.png">
-  <img alt="A request from Claude Code, Codex or Hermes goes through 4 stages. Route: a hook binds the chat to one task folder and injects its state. Work: task files, on-demand skills, a test guard and file locks. Prove: the ledger runs the checks itself and refuses the move if one fails, then a different agent reviews. Remember: results go back into the task files and the chat archive. Below: repeated mistakes become checks, 4 background services run without me, and the measured numbers." src="visuals/overview-light.png">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/visuals/overview-dark.png">
+  <img alt="A request from Claude Code, Codex or Hermes goes through 4 stages. Route: a hook binds the chat to one task folder and injects its state. Work: task files, on-demand skills, a test guard and file locks. Prove: the ledger runs the checks itself and refuses the move if one fails, then a different agent reviews. Remember: results go back into the task files and the chat archive. Below: repeated mistakes become checks, 4 background services run without me, and the measured numbers." src="docs/visuals/overview-light.png">
 </picture>
 
 One question: **what happens to a request, and why can I trust the result?** Every word in the picture is a real command, file or number from this repo.
@@ -21,8 +23,8 @@ One question: **what happens to a request, and why can I trust the result?** Eve
 ## 2 What "done" has to prove
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="visuals/ledger-dark.png">
-  <img alt="The ledger's stages from ready to done, with the evidence each move needs: owner and checks, its own worktree, a report with checks the ledger runs itself, a reviewer who isn't the owner, a merge with checks on the combined repo, and a pointer to the check that prevents the mistake. Every move is one git commit and one audit-log line." src="visuals/ledger-light.png">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/visuals/ledger-dark.png">
+  <img alt="The ledger's stages from ready to done, with the evidence each move needs: owner and checks, its own worktree, a report with checks the ledger runs itself, a reviewer who isn't the owner, a merge with checks on the combined repo, and a pointer to the check that prevents the mistake. Every move is one git commit and one audit-log line." src="docs/visuals/ledger-light.png">
 </picture>
 
 This is the part I'd point an interviewer to. It's a small workflow engine: an explicit transition table, evidence per edge, an append-only audit log, and rollback on partial failure (650 lines, 24 tests).
@@ -96,29 +98,53 @@ This is the part I'd point an interviewer to. It's a small workflow engine: an e
 | What | Value | How measured |
 |---|---|---|
 | Commits | 1,087 since 2026-10-08 | `git rev-list --count HEAD` |
-| Tests | 304 pass · 1 env-only fail | pytest per file over `systems/` |
-| Core code | 26 Python CLIs/modules · 10,163 lines | `wc -l` over `systems/` |
+| Tests | 274 in this repo, 304 in the full private system | `sh scripts/test.sh` (CI on Ubuntu + macOS) |
+| Code in this repo | 18 CLIs/modules · 7,718 lines · tests 4,146 lines | `wc -l systems/* tests/*` |
 | Agent sessions | 7,165 | Hermes `state.db` |
 | Change health | 13% rework · 0% change-fail (30 d) | `systems/dora` |
 
 ## 5 Design decisions + ideas borrowed
 
-The calls that shaped it:
-1. Plain files + git over a database: agents and I read the same thing, and history is free.
-2. Evidence-gated transitions over free-form status: "done" has to be proven.
-3. Hooks over prompts: a rule broken twice becomes code.
-4. One task = one folder with fixed level files: any agent can boot cold.
-5. At most 7 items per level: people can't hold more.
-6. Memory is untrusted: recall informs a decision but never overrides current files.
+The calls that shaped it, one ADR each (context → decision → consequences):
+1. [Plain files + git over a database](docs/adr/0001-plain-files-and-git-over-a-database.md): agents and I read the same thing, and history is free.
+2. [Evidence-gated task states](docs/adr/0002-evidence-gated-task-states.md): "done" has to be proven.
+3. [Advisory locks + leases](docs/adr/0003-advisory-locks-and-leases-for-concurrent-agents.md): agents run in parallel without corrupting each other.
+4. [Hooks over prompts](docs/adr/0004-hooks-over-prompts.md): a rule broken twice becomes code.
+5. [One task = one folder](docs/adr/0005-one-task-one-folder.md): any agent can boot cold.
+6. [Memory is untrusted](docs/adr/0006-memory-is-untrusted.md): recall informs a decision but never overrides current files.
 
 **Ideas borrowed:** I read the field before building each part: [mattpocock/skills](https://github.com/mattpocock/skills) (problem → fix skills), poteto's pstack in [cursor/plugins](https://github.com/cursor/plugins) (`/correct`: make a repeat mistake impossible), [obra/superpowers](https://github.com/obra/superpowers) (chained workflow), [garrytan/gstack](https://github.com/garrytan/gstack), [anthropics/skills](https://github.com/anthropics/skills), Nygard's ADRs and Google's DORA metrics.
 
 ## 6 What's in this repo
 
 ```
-README.md       this page
-visuals/        the 2 pictures above: HTML on shared design tokens (DESIGN.md, GitHub Primer colors)
-                python3 visuals/render.py → light + dark PNG
+systems/    the CLIs: ledger · ctx · agent_core · agent_services · native_activation · runs · dora · front-door · provenance …
+tests/      274 tests, 1 file per tool · sh scripts/test.sh
+hooks/      ready-to-use hook configs for Claude Code · Codex · Hermes + test-guard
+skills/     24 of my engineering skills by SDLC stage (plan → understand → process → verify) + system skills
+docs/       adr/ (6 design decisions) · visuals/ (the 2 pictures above, HTML on GitHub Primer tokens)
+scripts/    test.sh
 ```
 
-The system runs in my private workspace. I'm moving the CLIs, hooks, skills and a sample task folder here piece by piece, with personal paths and data stripped out, and each one will land with its tests.
+| Start here | Lines | Tests | What to look at |
+|---|---|---|---|
+| [`systems/ledger`](systems/ledger) | 650 | 24 | transition table (`FLOW`), evidence rules, rollback on partial failure |
+| [`systems/agent_core.py`](systems/agent_core.py) | 1,732 | 47 | `fcntl` locks, scoped writer leases, real-process race tests |
+| [`systems/ctx`](systems/ctx) | 1,347 | 66 | markdown as a database, 1 commit per change, `index.lock` retry |
+| [`systems/native_activation.py`](systems/native_activation.py) | 727 | 27 | session → task binding, boot packet, lease release on session end |
+| [`systems/ground_truth.py`](systems/ground_truth.py) | 224 | 23 | spots a correction in my message, logs it, injects my top rules |
+| [`skills/all/system/docs-over-chat`](skills/all/system/docs-over-chat/SKILL.md) | | | the rule everything else serves: work lives in files, not chat |
+
+<details><summary>Run it</summary>
+
+```bash
+git clone https://github.com/raychu23/Development-Tools && cd Development-Tools
+pip install pytest pyyaml
+sh scripts/test.sh                      # all 274 tests, 1 process per file
+python3 systems/ledger --help           # new · move · show · board · ready
+```
+
+Hooks: copy a file from `hooks/` into your harness config and set `WORKSPACE` to the repo that holds your task folders.
+</details>
+
+The tools come from my private workspace, copied by an export script that strips personal paths. Tools tied to that workspace's layout (chat archive, file-org sync) stay private for now.

@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""where each skill came from, kept simple (raymond 2026-10-17: "just say ext repo name, very simple")
+    file    SKILL.md frontmatter   metadata: source: own      or   source: ext <repo> <url>   (copied-in skills)
+            skills inside a git clone under skills/ are ext <clone folder name> automatically, nothing to write
+    part    <!-- ext <repo> -->  …  <!-- /ext <repo> -->   around lines taken from a repo
+    repos   the list = systems/skills-map (bottom of the map in skills/0 start.md + Context/overview.md)
+commands
+    python3 systems/provenance check                      every live skill has a source · exit 1 if not
+    python3 systems/provenance stamp                      add  source: own  to own SKILL.md missing it
+    python3 systems/provenance tag <file> <from> <to> <repo>   wrap lines from..to (1-based) in ext markers"""
+import argparse, importlib.machinery, importlib.util, re, sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+ROOT = Path(__file__).resolve().parent.parent
+FRONT = re.compile(r'\A---\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)', re.S)
+
+
+def _map():
+    l = importlib.machinery.SourceFileLoader('skills_map', str(Path(__file__).with_name('skills-map')))
+    m = importlib.util.module_from_spec(importlib.util.spec_from_loader(l.name, l)); l.exec_module(m)
+    return m
+
+
+def has_source(text):
+    m = FRONT.match(text)
+    return bool(m and re.search(r'^\s+source:\s*(own|ext \S+)', m.group(1), re.M))
+
+
+def stamp(files):
+    done = []
+    for f in files:
+        t = f.read_text()
+        m = FRONT.match(t)
+        if not m or has_source(t):
+            continue
+        head = m.group(1)
+        mm = re.search(r'^metadata:[ \t]*$', head, re.M)
+        if mm:
+            rest = head[mm.end():].lstrip('\r\n').split('\n')
+            ind = (re.match(r'([ \t]+)\S', rest[0]) or [None, '  '])[1] if rest else '  '
+            head = re.sub(rf'^{ind}source:.*\n?', '', head, flags=re.M) if re.search(rf'^{ind}source:', head, re.M) else head
+            mm = re.search(r'^metadata:[ \t]*$', head, re.M)
+            head = head[:mm.end()] + f'\n{ind}source: own' + head[mm.end():]
+        elif re.search(r'^metadata:', head, re.M):
+            print(f'skip (metadata not a block, add source by hand): {f}', file=sys.stderr); continue
+        else:
+            head += '\nmetadata:\n  source: own'
+        f.write_text('---\n' + head + '\n---\n' + t[m.end():])
+        done.append(str(f))
+    return done
+
+
+def check():
+    """problems: own SKILL.md without a source line"""
+    sm = _map()
+    rows, _ = sm.skills()
+    bad = []
+    for r in rows:
+        if r['frm'] == 'own' and not has_source((sm.SK / r['path'] / 'SKILL.md').read_text(errors='ignore')):
+            bad.append(f"skills/{r['path']}/SKILL.md: no source (python3 systems/provenance stamp)")
+    return bad
+
+
+def tag(path, a, b, repo):
+    p = Path(path)
+    text = p.read_text()
+    lines = text.split('\n')
+    fm = FRONT.match(text)
+    if fm and a <= fm.group(0).count('\n'):
+        raise SystemExit('lines overlap the frontmatter: use source: ext <repo> for the whole file')
+    if not (1 <= a <= b <= len(lines)):
+        raise SystemExit(f'lines {a}-{b} outside 1-{len(lines)}')
+    ind = re.match(r'\s*', lines[a - 1]).group(0)
+    lines[a - 1:b] = [f'{ind}<!-- ext {repo} -->', *lines[a - 1:b], f'{ind}<!-- /ext {repo} -->']
+    p.write_text('\n'.join(lines))
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    sub.add_parser('check'); sub.add_parser('stamp')
+    t = sub.add_parser('tag'); t.add_argument('file'); t.add_argument('a', type=int); t.add_argument('b', type=int); t.add_argument('repo')
+    a = ap.parse_args(argv)
+    if a.cmd == 'check':
+        bad = check()
+        print('\n'.join(bad) or 'provenance ok'); return 1 if bad else 0
+    if a.cmd == 'stamp':
+        sm = _map()
+        files = [sm.SK / r['path'] / 'SKILL.md' for r in sm.skills()[0] if r['frm'] == 'own']
+        print('\n'.join(stamp(files)) or 'nothing to stamp'); return 0
+    tag(a.file, a.a, a.b, a.repo); return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

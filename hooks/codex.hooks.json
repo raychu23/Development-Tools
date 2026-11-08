@@ -1,0 +1,74 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$WORKSPACE/systems/ctx-hook\" --native --root \"$WORKSPACE\" --harness codex session-start"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$WORKSPACE/systems/ctx-hook\" --native --root \"$WORKSPACE\" --harness codex prompt"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$WORKSPACE/systems/ctx-hook\" --native --root \"$WORKSPACE\" --harness codex pre-tool"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$WORKSPACE/systems/ctx-hook\" --native --root \"$WORKSPACE\" --harness codex post-tool"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$WORKSPACE/systems/ctx-hook\" --native --root \"$WORKSPACE\" --harness codex pre-compact"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$WORKSPACE/systems/ctx-hook\" --native --root \"$WORKSPACE\" --harness codex stop"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$WORKSPACE/systems/ctx-hook\" --native --root \"$WORKSPACE\" --harness codex session-end"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,1347 @@
+#!/usr/bin/env python3
+"""ctx: raymond's idea-tree engine (rules.md §10, T2 c bot-platform P1 + P2)
+
+files + git are the only truth. every action edits plain md files, never deletes, and makes 1 small git commit.
+actions run under a repo lock, check before they write, and roll back their own edits when anything fails.
+
+    tree     [scope] [--json]                 task tree: folders with 0 start.md (c / o / d subideas, agents) + notes with carry:
+    board    [scope] [--json]                 every bot (T<n>-a<n>-* folders + any 0 start with owner:) with status, heartbeat, next, needs-you
+    boot     <task> [--max-chars N]           boot pack: 0 start in full + pinned notes in full + inbox      read-only
+    pin      <note> [--text T]                note → carry: pin      with --text: add T to the task's pinned row
+    auto     <note>                           note → carry: auto (the default: listed, not loaded in full)
+    drop     <note> [--text T]                note → carry: drop      with --text: move the matching 0 start line into 4 log/dropped.md (dated)
+    merge-up <note> [--text T]                copy key lines (goal · status, or T) into the parent 0 start "merged up" row
+    relegate <c folder> [--dead] [--no-merge] merge up, then c <x> → o <x> (or d <x>) by git mv, links in the task fixed, nothing deleted
+    rotate   <task> [--session S]             session log row in 4 log/sessions.md, frontmatter session cleared, prints boot pack
+    send     <task> <text> [--from F]         append a dated q row to the target's inbox block (bot ↔ bot)
+    set      <note> key=value ...             frontmatter fields (status owner next session …)
+    beat     <task> [--session S] [--harness H] [--event E] [--status T] [--next T]
+                                              heartbeat → systems/state/beats.json (git-ignored, no commit)      --status / --next also set frontmatter + commit
+
+global: --root DIR (else $CTX_ROOT, else the folder above systems/)      --no-commit      --include-dirty (allow editing a file that has uncommitted edits)
+commit author: $CTX_GIT_NAME / $CTX_GIT_EMAIL (default "Raymond Chu" / "")      trailers: $CTX_TRAILERS (newline separated) + --trailer
+"""
+import argparse
+import contextlib
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+import uuid
+
+LEVEL_FILES = {'0 start.md', '1 takeaways.md', '2 insights.md', '3 workflow.md'}
+PRUNE = {'.git', 'node_modules', '__pycache__', 'full', 'assets', '.obsidian', 'Deleted', '.worktrees'}
+AGENT_RE = re.compile(r'^T\d+-a\d+-')
+TASK_RE = re.compile(r'^T\d+-')
+SUB_RE = re.compile(r'^([cod]) (.+)$')
+GAP = '      '
+PACKET_MAX = 40
+TOPICS = ('Interview', 'Work', 'Project', 'Portfolio', 'Class', 'Context')  # rules.md: topic folders; never Notes/
+
+
+class CtxError(Exception):
+    pass
+
+
+# ---------- time + paths ----------
+
+def now():
+    return dt.datetime.now().strftime('%Y-%m-%d %H:%M')
+
+
+def today():
+    return dt.datetime.now().strftime('%Y-%m-%d')
+
+
+def find_root(arg):
+    if arg:
+        return os.path.abspath(arg)
+    if os.environ.get('CTX_ROOT'):
+        return os.path.abspath(os.environ['CTX_ROOT'])
+    return os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+
+def inside(root, p):
+    r = os.path.realpath(root)
+    q = os.path.realpath(p)
+    return q == r or q.startswith(r + os.sep)
+
+
+def resolve(root, p):
+    """a note path: absolute, or relative to cwd (when cwd is inside root), else relative to root      must lie inside root"""
+    cands = []
+    if os.path.isabs(p):
+        cands.append(p)
+    else:
+        if inside(root, os.getcwd()):
+            cands.append(os.path.join(os.getcwd(), p))
+        cands.append(os.path.join(root, p))
+    for q in cands:
+        q = os.path.normpath(q)
+        if os.path.exists(q):
+            if not inside(root, q):
+                raise CtxError(f'outside the root {root}: {p}')
+            return q
+    raise CtxError(f'not found: {p}')
+
+
+def rel(root, p):
+    return os.path.relpath(p, root)
+
+
+def note_file(path):
+    """folder → its 0 start.md      .md file → itself"""
+    if os.path.isdir(path):
+        f = os.path.join(path, '0 start.md')
+        if not os.path.isfile(f):
+            raise CtxError(f'no 0 start.md in {path}')
+        return f
+    if path.endswith('.md'):
+        return path
+    raise CtxError(f'not a note (folder with 0 start.md, or .md file): {path}')
+
+
+def read(p):
+    with open(p, encoding='utf-8') as f:
+        return f.read()
+
+
+def write(p, text):
+    p = os.path.realpath(p)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    fd, staged = tempfile.mkstemp(prefix='.ctx-', dir=os.path.dirname(p))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        if os.path.exists(p):
+            os.chmod(staged, os.stat(p).st_mode & 0o777)
+        os.replace(staged, p)
+        dfd = os.open(os.path.dirname(p), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    finally:
+        if os.path.exists(staged):
+            os.unlink(staged)
+
+
+@contextlib.contextmanager
+def flock(path, timeout=30):
+    """exclusive lock on a lock file (the file stays, it is never deleted)"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'a') as fh:
+        end = time.time() + timeout
+        while True:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.time() > end:
+                    raise CtxError(f'busy: another ctx holds {path}')
+                time.sleep(0.1)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+# ---------- frontmatter (only top-level key: value lines are read or changed, every other line kept as-is) ----------
+
+FM_KEY = re.compile(r'^([A-Za-z0-9_-]+):(.*)$')
+
+
+def split_fm(text):
+    """→ (frontmatter lines, body)      no frontmatter → (None, text)"""
+    if not text.startswith('---\n'):
+        return None, text
+    if text.startswith('---\n---\n'):
+        return [], text[8:]
+    end = text.find('\n---\n', 3)
+    if end < 0:
+        if text.endswith('\n---') and len(text) > 7:
+            return text[4:-4].split('\n'), ''
+        return None, text
+    return text[4:end].split('\n'), text[end + 5:]
+
+
+def fm_items(text):
+    lines, _ = split_fm(text)
+    out = {}
+    for line in lines or []:
+        m = FM_KEY.match(line)
+        if m:
+            out[m.group(1)] = m.group(2).strip()
+    return out
+
+
+def fm_get(text, key, default=None):
+    return fm_items(text).get(key, default)
+
+
+def fm_set(text, **kv):
+    lines, body = split_fm(text)
+    lines = [] if lines is None else lines
+    for k, v in kv.items():
+        v = '' if v is None else clean(v, semis=False)
+        new = f'{k}: {v}' if v else f'{k}:'
+        for i, line in enumerate(lines):
+            m = FM_KEY.match(line)
+            if m and m.group(1) == k:
+                lines[i] = new
+                break
+        else:
+            lines.append(new)
+    return '---\n' + ''.join(line + '\n' for line in lines) + '---\n' + body
+
+
+def clean(text, semis=True):
+    """free text → 1 safe notes line: no newlines, no code fences, no semicolons (rules.md §7)"""
+    t = ' '.join(str(text).replace('\r', ' ').split('\n'))
+    t = t.replace('`' * 3, "'" * 3)
+    if semis:
+        t = t.replace(';', ',')
+    return t.strip()
+
+
+# ---------- notes packet (first ```notes block of 0 start.md) ----------
+
+FENCE = re.compile(r'```notes\n(.*?)```', re.S)
+
+
+def packet_span(text):
+    m = FENCE.search(text)
+    if not m:
+        raise CtxError('no ```notes block')
+    return m.start(1), m.end(1)
+
+
+def indent(line):
+    return len(line) - len(line.lstrip(' '))
+
+
+def cue_of(line):
+    return line.strip().split('  ')[0].strip()
+
+
+def row_value(lines, cue):
+    """first value segment of a 4-indent row 'cue      value      more'"""
+    for line in lines:
+        if indent(line) == 4 and cue_of(line) == cue:
+            rest = line.strip()[len(cue):].strip()
+            return re.split(r' {6,}', rest)[0] if rest else ''
+    return None
+
+
+def row_summary(lines, cue):
+    """row value for display: first segment, plus the next one when the first is only a date (status rows lead with one)"""
+    for line in lines:
+        if indent(line) == 4 and cue_of(line) == cue:
+            rest = line.strip()[len(cue):].strip()
+            segs = re.split(r' {6,}', rest) if rest else ['']
+            if len(segs) > 1 and re.match(r'^\d{4}-\d{2}-\d{2}$', segs[0]):
+                return segs[0] + ' ' + segs[1]
+            return segs[0]
+    return None
+
+
+def packet_lines(text):
+    a, b = packet_span(text)
+    return text[a:b].split('\n')
+
+
+def packet_len(text):
+    """lines in the packet, counted the way systems/check-task.sh counts them"""
+    try:
+        a, b = packet_span(text)
+    except CtxError:
+        return 0
+    return len(text[a:b].splitlines())
+
+
+def check_packet(old, new, path):
+    """the edit keeps the packet ≤40 lines (or no longer than it was) and every line at a multiple of 4"""
+    n_old, n_new = packet_len(old), packet_len(new)
+    if n_new > max(PACKET_MAX, n_old):
+        raise CtxError(f'{path}: packet would be {n_new} lines (max {PACKET_MAX})      drop or merge something first')
+    bad = [l for l in packet_lines(new) if l.strip() and indent(l) % 4]
+    old_bad = [l for l in packet_lines(old) if l.strip() and indent(l) % 4] if old else []
+    if len(bad) > len(old_bad):
+        raise CtxError(f'{path}: edit would put a line off the 4-space grid: {bad[-1].strip()[:60]}')
+
+
+def value_col(line, cue):
+    """column where the value starts on a cue row, rounded up to the 4-space grid (continuation lines align there)"""
+    i = line.index(cue) + len(cue)
+    while i < len(line) and line[i] == ' ':
+        i += 1
+    if i >= len(line):
+        return 28
+    return (i + 3) // 4 * 4
+
+
+def row_range(lines, cue):
+    """(start, end) line indexes of a row incl. its continuation / sub lines      None if missing"""
+    for i, line in enumerate(lines):
+        if indent(line) == 4 and cue_of(line) == cue:
+            j = i + 1
+            while j < len(lines) and lines[j].strip() and indent(lines[j]) > 4:
+                j += 1
+            return i, j
+    return None
+
+
+def add_to_row(text, cue, value, before=('came from', 'links', 'harness')):
+    """append value as a continuation line of row cue (create row if missing)"""
+    a, b = packet_span(text)
+    lines = text[a:b].split('\n')
+    r = row_range(lines, cue)
+    if r:
+        i, j = r
+        head = lines[i]
+        if head.strip() == cue:  # empty row: value goes on the cue line
+            lines[i] = '    ' + cue.ljust(24) + value
+        else:
+            lines.insert(j, ' ' * value_col(head, cue) + value)
+    else:
+        at = None
+        for c in before:
+            rr = row_range(lines, c)
+            if rr:
+                at = rr[0]
+                break
+        if at is None:
+            at = len(lines) - 1 if lines and lines[-1] == '' else len(lines)
+        lines.insert(at, '    ' + cue.ljust(24) + value)
+    return text[:a] + '\n'.join(lines) + text[b:]
+
+
+def cut_line(text, needle):
+    """remove the 1 packet line / segment containing needle → (new text, removed text, row cue)"""
+    a, b = packet_span(text)
+    lines = text[a:b].split('\n')
+    hits = [i for i, l in enumerate(lines) if needle in l]
+    if not hits:
+        raise CtxError(f'no 0 start packet line contains: {needle}')
+    if len(hits) > 1:
+        raise CtxError(f'{len(hits)} lines contain "{needle}", be more specific')
+    i = hits[0]
+    line = lines[i]
+    cue = None
+    if indent(line) < 4:
+        raise CtxError('that is the packet title line, it cannot be dropped')
+    if indent(line) == 4:  # cue row: cut only the matching segment, keep the cue
+        cue = cue_of(line)
+        col = value_col(line, cue)
+        segs = re.split(r' {6,}', line[col:].strip())
+        seg = [s for s in segs if needle in s]
+        if not seg:
+            raise CtxError('that is a row name, drop a value on it instead')
+        removed = seg[0]
+        segs.remove(removed)
+        if segs:
+            lines[i] = line[:col] + GAP.join(segs)
+        elif i + 1 < len(lines) and lines[i + 1].strip() and indent(lines[i + 1]) > 4:
+            lines[i] = line[:col] + lines[i + 1].strip()  # pull the first continuation up
+            del lines[i + 1]
+        else:
+            lines[i] = line[:col].rstrip()
+    else:
+        removed = line.strip()
+        for k in range(i - 1, -1, -1):
+            if indent(lines[k]) == 4:
+                cue = cue_of(lines[k])
+                break
+        del lines[i]
+    return text[:a] + '\n'.join(lines) + text[b:], removed, cue
+
+
+def name_re(name):
+    """a folder name as a whole word in a path or a notes line (not a prefix of 'c x-v2', not inside 'xc x')"""
+    return re.compile(r'(?<![\w-])' + re.escape(name) + r'(?![\w-]| [\w])')
+
+
+# ---------- tree ----------
+
+def task_of(root, path):
+    """nearest folder (self or above) with 0 start.md"""
+    d = path if os.path.isdir(path) else os.path.dirname(path)
+    while True:
+        if os.path.isfile(os.path.join(d, '0 start.md')):
+            return d
+        if os.path.normpath(d) == os.path.normpath(root) or os.path.dirname(d) == d:
+            raise CtxError(f'no task folder (0 start.md) at or above {path}')
+        d = os.path.dirname(d)
+
+
+def parent_of(root, node):
+    """frontmatter parent: (relative to the node's folder) wins, else nearest ancestor with 0 start.md"""
+    f = note_file(node)
+    p = fm_get(read(f), 'parent')
+    base = node if os.path.isdir(node) else os.path.dirname(node)
+    if p:
+        q = os.path.normpath(os.path.join(base, p))
+        if os.path.exists(q) and inside(root, q):
+            return q if os.path.isdir(q) else task_of(root, q)
+    if not os.path.isdir(node):
+        return task_of(root, base)  # a loose note's parent is the task it sits in
+    return task_of(root, os.path.dirname(node))
+
+
+def kind_of(name):
+    m = SUB_RE.match(name)
+    if m:
+        return {'c': 'current', 'o': 'old', 'd': 'dead'}[m.group(1)]
+    if AGENT_RE.match(name):
+        return 'agent'
+    if TASK_RE.match(name):
+        return 'task'
+    return 'folder'
+
+
+def core_state(folder):
+    """the core engine's state for an enrolled task folder, None when it is not enrolled"""
+    contract = os.path.join(folder, 'systems', 'task.json')
+    if not os.path.isfile(contract):
+        return None
+    try:
+        return json.loads(read(contract)).get('state') or 'unknown'
+    except (OSError, ValueError, AttributeError):
+        return 'unreadable'
+
+
+def node_info(root, path, depth):
+    f = note_file(path)
+    t = read(f)
+    try:
+        lines = packet_lines(t)
+    except CtxError:
+        lines = []
+    name = os.path.basename(path) if os.path.isdir(path) else os.path.basename(path)[:-3]
+    state = core_state(path) if os.path.isdir(path) else None
+    # enrolled tasks always show the core state, never a legacy status row
+    status = f'core state: {state}' if state else fm_get(t, 'status') or row_summary(lines, 'status') or ''
+    nxt = fm_get(t, 'next') or row_value(lines, 'next') or ''
+    return {
+        'path': rel(root, path),
+        'name': name,
+        'kind': kind_of(name) if os.path.isdir(path) else 'note',
+        'carry': fm_get(t, 'carry') or 'auto',
+        'status': status[:160],
+        'next': nxt[:160],
+        'owner': fm_get(t, 'owner', ''),
+        'parent': fm_get(t, 'parent', ''),
+        'depth': depth,
+        'needs_you': count_open_q(t),
+    }
+
+
+def count_open_q(text):
+    """q rows whose a row is still empty"""
+    n = 0
+    lines = text.split('\n')
+    for i, l in enumerate(lines):
+        if re.match(r'^ +q\d* ', l) or re.match(r'^ +q\d+$', l.rstrip()):
+            for k in range(i + 1, min(i + 4, len(lines))):
+                s = lines[k].strip()
+                if s == 'a':
+                    n += 1
+                    break
+                if s.startswith('a ') or re.match(r'^q\d* ', s):
+                    break
+    return n
+
+
+def walk_nodes(root, scope, own_only=False):
+    """depth-first: folders with 0 start.md, and .md notes with carry: (skip level files)
+    own_only: stay inside the scope task (do not enter child tasks / agents, which are other bots)"""
+    out = []
+
+    def visit(d, depth, top):
+        try:
+            entries = sorted(os.listdir(d))
+        except OSError:
+            return
+        if os.path.isfile(os.path.join(d, '0 start.md')):
+            if own_only and not top and kind_of(os.path.basename(d)) in ('task', 'agent'):
+                return
+            try:
+                out.append(node_info(root, d, depth))
+            except (OSError, UnicodeDecodeError):
+                return
+            depth += 1
+            for e in entries:
+                p = os.path.join(d, e)
+                if os.path.isfile(p) and e.endswith('.md') and e not in LEVEL_FILES:
+                    try:
+                        if fm_get(read(p), 'carry'):
+                            out.append(node_info(root, p, depth))
+                    except (OSError, UnicodeDecodeError):
+                        pass
+        for e in entries:
+            p = os.path.join(d, e)
+            if os.path.isdir(p) and not os.path.islink(p) and not e.startswith('.') and e not in PRUNE and not e.startswith('4 log'):
+                visit(p, depth, False)
+
+    visit(scope, 0, True)
+    return out
+
+
+# ---------- heartbeats (volatile, not in git) ----------
+
+def beats_path(root):
+    return os.path.join(root, 'systems', 'state', 'beats.json')
+
+
+def load_beats(root):
+    try:
+        return json.loads(read(beats_path(root)))
+    except (OSError, ValueError):
+        return {}
+
+
+def update_beats(root, fn):
+    """read → fn(dict) → write, under a lock so 2 sessions never lose each other's heartbeats"""
+    p = beats_path(root)
+    with flock(os.path.join(os.path.dirname(p), 'beats.lock'), timeout=10):
+        b = load_beats(root)
+        fn(b)
+        write(p, json.dumps(b, indent=1, sort_keys=True) + '\n')
+    gi = os.path.join(os.path.dirname(p), '.gitignore')
+    if not os.path.exists(gi):
+        write(gi, '*\n')
+    return b
+
+
+# ---------- git ----------
+
+def git(root, *args, check=True):
+    env = dict(os.environ, GIT_OPTIONAL_LOCKS='0', GIT_LITERAL_PATHSPECS='1')
+    r = subprocess.run(['git', '-C', root] + list(args), capture_output=True, text=True, env=env)
+    if check and r.returncode:
+        raise CtxError('git ' + ' '.join(args[:2]) + ': ' + (r.stderr or r.stdout).strip())
+    return r
+
+
+def in_git(root):
+    r = subprocess.run(['git', '-C', root, 'rev-parse', '--is-inside-work-tree'], capture_output=True, text=True)
+    return r.returncode == 0 and r.stdout.strip() == 'true'
+
+
+def git_dir(root, common=False):
+    r = git(root, 'rev-parse', '--git-common-dir' if common else '--git-dir', check=False)
+    d = r.stdout.strip()
+    return os.path.normpath(os.path.join(root, d)) if d else None
+
+
+def lock_path(root):
+    d = git_dir(root, common=True) if in_git(root) else None
+    return os.path.join(d, 'ctx.lock') if d else os.path.join(root, 'systems', 'state', 'ctx.lock')
+
+
+def tracked(root, p):
+    return bool(git(root, 'ls-files', '--', rel(root, p), check=False).stdout.strip())
+
+
+def legacy_journal_dir(root):
+    private = git_dir(root) if in_git(root) else os.path.join(root, 'systems', 'state')
+    return os.path.join(private, 'ctx-operations')
+
+
+def _folder_hashes(path):
+    import hashlib
+    hashes = {}
+    for cur, _, files in os.walk(path):
+        for fn in files:
+            p = os.path.join(cur, fn)
+            if not os.path.islink(p):
+                with open(p, 'rb') as f:
+                    hashes[os.path.relpath(p, path)] = hashlib.sha256(f.read()).hexdigest()
+    return hashes
+
+
+def _legacy_problem(record):
+    try:
+        from agent_core import legacy_problem
+    except ImportError:  # legacy engine used by itself
+        return None if isinstance(record, dict) and 'operation_id' in record else 'not a legacy journal object'
+    return legacy_problem(record)
+
+
+def recover_legacy(root):
+    """Reconcile interrupted legacy actions under the repository writer lock.
+
+    A later edit turns the action into an explicit conflict. No recovery overwrites
+    a file whose current content is outside the journal's before/after pair.
+    """
+    directory = legacy_journal_dir(root)
+    if not os.path.isdir(directory):
+        return []
+    reports = []
+    for fn in sorted(os.listdir(directory)):
+        if not fn.endswith('.json'):
+            continue
+        path = os.path.join(directory, fn)
+        if not os.path.isfile(path):
+            continue
+        try:
+            record = json.loads(read(path))
+            problem = _legacy_problem(record)
+        except (OSError, ValueError) as e:  # UnicodeDecodeError and JSONDecodeError are ValueErrors
+            record, problem = None, f'unreadable JSON: {e}'
+        if problem:
+            # A named conflict, never a traceback. Paths are unknown, so it blocks writes until quarantined.
+            reports.append({'operation_id': fn[:-5], 'phase': 'corrupt', 'record': path, 'reason': problem,
+                            'conflicts': ['*'], 'repair': f'ctx system recover --quarantine "{path}"'})
+            continue
+        if record.get('phase') in ('committed', 'rolled_back', 'no_commit', 'abandoned'):
+            continue
+        oid = record['operation_id']
+        if in_git(root):
+            receipt = git(root, 'log', '-1', '--format=%H', '--fixed-strings', '--grep', f'Ctx-Operation: {oid}', check=False).stdout.strip()
+            if receipt:
+                record.update(phase='committed', commit=receipt)
+                write(path, json.dumps(record, indent=2) + '\n')
+                reports.append({'operation_id': oid, 'phase': 'committed', 'commit': receipt})
+                continue
+        conflicts = []
+        restored = []
+        moves = record.get('moves', [])
+        for item in record.get('writes', []):
+            original = os.path.join(root, item['path'])
+            current = original
+            for move in moves:
+                src, dst = (os.path.join(root, move[k]) for k in ('source', 'target'))
+                if current.startswith(src + os.sep) and not os.path.exists(current):
+                    current = dst + current[len(src):]
+            if not inside(root, current):
+                conflicts.append(item['path'])
+                continue
+            actual = read(current) if os.path.isfile(current) else None
+            if actual not in (item['before'], item['after']):
+                conflicts.append(item['path'])
+            restored.append((current, item['before'], item['after']))
+        for move in moves:
+            src, dst = (os.path.join(root, move[k]) for k in ('source', 'target'))
+            if not inside(root, src) or not inside(root, dst):
+                conflicts.append(move['source'])
+            elif os.path.exists(src) and os.path.exists(dst):
+                conflicts.append(move['source'])
+            elif os.path.exists(dst) and _folder_hashes(dst) != move['hashes']:
+                conflicts.append(move['target'])
+            elif not os.path.exists(src) and not os.path.exists(dst):
+                conflicts.append(move['source'])
+        if conflicts:
+            record.update(phase='conflict', conflicts=sorted(set(conflicts)))
+            write(path, json.dumps(record, indent=2) + '\n')
+            reports.append({'operation_id': oid, 'phase': 'conflict', 'conflicts': record['conflicts']})
+            continue
+        for current, before, after in restored:
+            actual = read(current) if os.path.isfile(current) else None
+            if actual not in (before, after):
+                conflicts.append(rel(root, current))
+                continue
+            if before is None:
+                if os.path.exists(current):
+                    os.unlink(current)  # only a file this uncommitted action created
+            else:
+                write(current, before)
+        for move in reversed(moves):
+            src, dst = (os.path.join(root, move[k]) for k in ('source', 'target'))
+            if os.path.exists(dst) and not os.path.exists(src):
+                expected = dict(move['hashes'])
+                for item in record.get('writes', []):
+                    original = os.path.join(root, item['path'])
+                    if original.startswith(src + os.sep):
+                        suffix = os.path.relpath(original, src)
+                        if item['before'] is None:
+                            expected.pop(suffix, None)
+                        else:
+                            expected[suffix] = hashlib.sha256(item['before'].encode()).hexdigest()
+                if _folder_hashes(dst) != expected:
+                    conflicts.append(move['target'])
+                    continue
+                os.rename(dst, src)
+        if conflicts:
+            record.update(phase='conflict', conflicts=sorted(set(conflicts)))
+            write(path, json.dumps(record, indent=2) + '\n')
+            reports.append({'operation_id': oid, 'phase': 'conflict', 'conflicts': record['conflicts']})
+            continue
+        if in_git(root):
+            owned = [item['path'] for item in record.get('writes', []) if not item.get('dirty_before')]
+            owned += [move[k] for move in moves for k in ('source', 'target')]
+            if owned:
+                git(root, 'reset', '-q', 'HEAD', '--', *owned, check=False)
+        record.update(phase='rolled_back', recovered=now())
+        write(path, json.dumps(record, indent=2) + '\n')
+        reports.append({'operation_id': oid, 'phase': 'rolled_back'})
+    return reports
+
+
+class Ctx:
+    def __init__(self, root, commit=True, trailers=(), include_dirty=False):
+        self.root = root
+        self.commit_on = commit and in_git(root)
+        self.include_dirty = include_dirty
+        self.trailers = [t for t in os.environ.get('CTX_TRAILERS', '').split('\n') if t.strip()] + list(trailers)
+        self.orig = {}  # path → text before this action (None: the file is new)
+        self.moves = []  # (src, dst, via git)
+        self.dirty_before = []
+        self.intended = {}
+        self.operation_id = str(uuid.uuid4())
+        self.journal = None
+        self.planned_moves = []
+
+    def journal_phase(self, phase='prepared', **extra):
+        if not self.orig and not self.planned_moves:
+            return
+        self.journal = self.journal or os.path.join(legacy_journal_dir(self.root), self.operation_id + '.json')
+        record = {'schema_version': 1, 'kind': 'legacy_ctx', 'operation_id': self.operation_id,
+                  'phase': phase, 'writes': [{'path': rel(self.root, p), 'before': old,
+                                            'after': self.intended.get(p), 'dirty_before': p in self.dirty_before}
+                                           for p, old in self.orig.items()], 'moves': self.planned_moves}
+        record.update(extra)
+        write(self.journal, json.dumps(record, indent=2) + '\n')
+
+    # ----- transactional file ops -----
+
+    def edit(self, p, text):
+        """write p, after the checks: inside root, not dirty with someone's uncommitted edit, packet still valid"""
+        if not inside(self.root, p):
+            raise CtxError(f'outside the root: {p}')
+        try:
+            from agent_core import guard_path
+            guard_path(self.root, p)
+        except ImportError:
+            pass  # compatibility when the legacy engine is used by itself
+        except Exception as e:
+            raise CtxError(str(e)) from e
+        exists = os.path.exists(p)
+        old = read(p) if exists else None
+        if old == text:
+            return False
+        if p not in self.orig:
+            if exists and self.commit_on and tracked(self.root, p):
+                st = git(self.root, 'status', '--porcelain', '--', rel(self.root, p), check=False).stdout.strip()
+                if st:
+                    if not self.include_dirty:
+                        raise CtxError(f'{rel(self.root, p)} has uncommitted edits      commit them first, or pass --include-dirty')
+                    self.dirty_before.append(p)
+            self.orig[p] = old
+        if os.path.basename(p) == '0 start.md' and old is not None:
+            check_packet(old, text, rel(self.root, p))
+        self.intended[p] = text
+        self.journal_phase()
+        write(p, text)
+        return True
+
+    def move(self, src, dst):
+        if not inside(self.root, src) or not inside(self.root, dst):
+            raise CtxError('move outside the root')
+        if os.path.exists(dst):
+            raise CtxError(f'already exists: {rel(self.root, dst)}')
+        try:
+            from agent_core import guard_path
+            guard_path(self.root, src)
+            guard_path(self.root, dst)
+        except ImportError:
+            pass
+        except Exception as e:
+            raise CtxError(str(e)) from e
+        self.planned_moves.append({'source': rel(self.root, src), 'target': rel(self.root, dst), 'hashes': _folder_hashes(src)})
+        self.journal_phase()
+        via_git = self.commit_on and tracked(self.root, src)
+        if via_git:
+            git(self.root, 'mv', '--', rel(self.root, src), rel(self.root, dst))
+        else:
+            os.rename(src, dst)
+        self.moves.append((src, dst, via_git))
+
+    def rollback(self):
+        """undo this action's own writes + moves (only what ctx itself did a moment ago)"""
+        notes = []
+        for p, old in self.orig.items():
+            original_path = p
+            for src, dst, _ in self.moves:  # a file edited inside a moved folder now lives under dst
+                if p.startswith(src + os.sep) and not os.path.exists(p):
+                    p = dst + p[len(src):]
+            try:
+                if os.path.exists(p) and read(p) not in (old, self.intended.get(original_path)):
+                    notes.append(f'{rel(self.root, p)}: later edit preserved, recovery conflict')
+                    continue
+                if old is None:
+                    os.remove(p)  # a file this action created a moment ago (no one else's info)
+                else:
+                    write(p, old)
+            except OSError as e:
+                notes.append(f'{rel(self.root, p)}: {e}')
+        for src, dst, via_git in reversed(self.moves):
+            try:
+                recorded = next(m for m in self.planned_moves if m['source'] == rel(self.root, src))
+                expected = dict(recorded['hashes'])
+                for path, old in self.orig.items():
+                    if path.startswith(src + os.sep):
+                        suffix = os.path.relpath(path, src)
+                        if old is None:
+                            expected.pop(suffix, None)
+                        else:
+                            expected[suffix] = hashlib.sha256(old.encode()).hexdigest()
+                if _folder_hashes(dst) != expected:
+                    notes.append(f'move back {rel(self.root, dst)}: later folder edit preserved, recovery conflict')
+                    continue
+                if via_git:
+                    git(self.root, 'mv', '--', rel(self.root, dst), rel(self.root, src))
+                else:
+                    os.rename(dst, src)
+            except (OSError, CtxError) as e:
+                notes.append(f'move back {rel(self.root, dst)}: {e}')
+        # a failed commit may have staged the edit: unstage this action's own paths (not ones that were dirty before it)
+        if self.commit_on:
+            back = [rel(self.root, p) for p in self.orig if p not in self.dirty_before and os.path.exists(p) and tracked(self.root, p)]
+            if back:
+                r = git(self.root, 'reset', '-q', '--', *back, check=False)
+                if r.returncode:
+                    notes.append('unstage: ' + r.stderr.strip())
+        self.journal_phase('conflict' if notes else 'rolled_back', conflicts=notes)
+        return notes
+
+    def commit(self, msg):
+        if not self.commit_on or not (self.orig or self.moves):
+            self.journal_phase('no_commit')
+            return None
+        touched = set(self.orig) | {d for _, d, _ in self.moves}
+        paths = sorted({rel(self.root, p) for p in touched if os.path.exists(p)})
+        gone = sorted({rel(self.root, s) for s, _, g in self.moves if g})
+        if paths:
+            self.git_retry('add', '-A', '--', *paths)
+        paths = sorted(set(paths) | set(gone))
+        if not git(self.root, 'diff', '--cached', '--name-only', 'HEAD', '--', *paths, check=False).stdout.strip():
+            self.journal_phase('committed', commit=git(self.root, 'rev-parse', 'HEAD').stdout.strip())
+            return None
+        body = msg + f'\n\nCtx-Operation: {self.operation_id}'
+        if self.dirty_before:
+            body += '\n\nincluded edits already uncommitted in: ' + ', '.join(rel(self.root, p) for p in self.dirty_before)
+        if self.trailers:
+            body += '\n\n' + '\n'.join(self.trailers)
+        name = os.environ.get('CTX_GIT_NAME', 'Raymond Chu')
+        email = os.environ.get('CTX_GIT_EMAIL', '')
+        self.journal_phase('committing')
+        self.git_retry('-c', f'user.name={name}', '-c', f'user.email={email}',
+                       'commit', '-q', '-m', body, '--only', '--', *paths)
+        receipt = git(self.root, 'rev-parse', '--short', 'HEAD').stdout.strip()
+        self.journal_phase('committed', commit=receipt)
+        return receipt
+
+    def git_retry(self, *args, tries=40):
+        """another git (raymond's editor, a bot) may hold index.lock for a moment: wait, then retry"""
+        for k in range(tries):
+            r = git(self.root, *args, check=False)
+            if r.returncode == 0:
+                return r
+            if 'index.lock' not in (r.stderr + r.stdout) or k == tries - 1:
+                shown = [a for i, a in enumerate(args) if a != '-c' and not (i and args[i - 1] == '-c')]
+                raise CtxError('git ' + ' '.join(shown[:2]) + ': ' + (r.stderr or r.stdout).strip())
+            time.sleep(0.25)
+
+    # ----- actions -----
+
+    def set_fields(self, node, **kv):
+        f = note_file(node)
+        task = task_of(self.root, node)
+        contract = os.path.join(task, 'systems', 'task.json')
+        if os.path.isfile(contract):
+            reserved = {'state', 'owner', 'task_id', 'requirement_rev', 'run_id'} & set(kv)
+            if reserved:
+                raise CtxError('managed contract fields require system commands: ' + ', '.join(sorted(reserved)))
+            if 'status' in kv:
+                # Display-only on enrolled tasks: any legacy word (done, shipped, …) could read as core
+                # state, so the write is refused and the board and tree show the core state instead.
+                raise CtxError(f'legacy status is not written on an enrolled task; core state is '
+                               f'{core_state(task)}      progress comes from ctx system submit/check/review/accept')
+        self.edit(f, fm_set(read(f), **kv))
+        return f
+
+    def carry(self, node, value, text=None):
+        if text is not None:
+            text = clean(text)
+            if not text:
+                raise CtxError('empty --text')
+            task = task_of(self.root, node)
+            f = note_file(task)
+            t = read(f)
+            if value == 'pin':
+                self.edit(f, add_to_row(t, 'pinned', text))
+                return f'pinned in {rel(self.root, f)}: {text}'
+            if value == 'drop':
+                new, removed, cue = cut_line(t, text)
+                self.edit(f, new)
+                lg = self.log_append(task, 'dropped.md', 'dropped (ctx drop, newest last, out of boot, still searchable)',
+                                     f'    {now()}      {cue or "—"}      {removed}')
+                return f'dropped from {rel(self.root, f)} → {rel(self.root, lg)}: {removed}'
+            raise CtxError('--text works with pin and drop only')
+        f = self.set_fields(node, carry=value)
+        return f'{rel(self.root, f)} carry: {value}'
+
+    def log_append(self, task_dir, name, header, row):
+        """4 log/<name>: 1 notes block, rows appended before its closing fence"""
+        p = os.path.join(task_dir, '4 log', name)
+        if os.path.exists(p):
+            t = read(p)
+            m = list(re.finditer(r'```notes\n(.*?)```', t, re.S))
+            if m:
+                k = m[-1].end(1)
+                t = t[:k] + row + '\n' + t[k:]
+            else:
+                t = t.rstrip('\n') + '\n\n```notes\n' + header + '\n' + row + '\n```\n'
+        else:
+            t = '```notes\n' + header + '\n' + row + '\n```\n'
+        self.edit(p, t)
+        return p
+
+    def merge_up(self, node, text=None):
+        parent = parent_of(self.root, node)
+        if os.path.normpath(parent) == os.path.normpath(node):
+            raise CtxError('no parent to merge into')
+        name = os.path.basename(node.rstrip('/'))
+        if text is None:
+            t = read(note_file(node))
+            lines = packet_lines(t)
+            bits = []
+            for cue in ('goal', 'status'):
+                v = fm_get(t, cue) or row_summary(lines, cue)
+                if v:
+                    bits.append(v)
+            text = ' · '.join(bits) or '(no goal / status rows)'
+        text = clean(text)[:300]
+        pf = note_file(parent)
+        line = f'{today()} {name}{GAP}{text}'
+        pt = read(pf)
+        new = add_to_row(pt, 'merged up', line)
+        if packet_len(new) > max(PACKET_MAX, packet_len(pt)):
+            # packet full: the merged line goes to the parent's 4 log, the packet gets nothing new
+            lg = self.log_append(os.path.dirname(pf), 'merged.md', 'merged up (ctx merge-up, packet was full, newest last)', '    ' + line)
+            return lg, f'merged up into {rel(self.root, lg)} (parent packet full): {name} — {text}'
+        self.edit(pf, new)
+        return pf, f'merged up into {rel(self.root, pf)}: {name} — {text}'
+
+    def relegate(self, node, dead=False, merge=True):
+        if not os.path.isdir(node):
+            raise CtxError('relegate takes a subidea folder')
+        base = os.path.basename(node.rstrip('/'))
+        m = SUB_RE.match(base)
+        if not m or m.group(1) != 'c':
+            raise CtxError(f'only a current subidea "c <name>" can be relegated: {base}')
+        newbase = ('d ' if dead else 'o ') + m.group(2)
+        dest = os.path.join(os.path.dirname(node), newbase)
+        if os.path.exists(dest):
+            raise CtxError(f'already exists: {rel(self.root, dest)}')
+        if os.path.isfile(os.path.join(node, 'systems', 'task.json')):
+            # The record repair after the move needs the owner: refuse before anything moves.
+            try:
+                from agent_core import Store
+                Store(self.root, commit=False)._owner(node, None, os.environ.get('CTX_OWNER_TOKEN'))
+            except ImportError:
+                pass
+            except Exception as e:
+                raise CtxError(f'relegating an enrolled task needs its owner credential before the move: {e}') from e
+        out = []
+        pat = name_re(base)
+        if merge:
+            pf = note_file(parent_of(self.root, node))
+            lines = packet_lines(read(pf))
+            rr = row_range(lines, 'merged up')
+            done = rr and any(pat.search(l) for l in lines[rr[0]:rr[1]])
+            mlog = os.path.join(os.path.dirname(pf), '4 log', 'merged.md')
+            if not done and os.path.exists(mlog):
+                done = bool(pat.search(read(mlog)))
+            if not done:
+                out.append(self.merge_up(node)[1])
+        self.move(node, dest)  # the folder moves as-is: 100% rename, git log --follow keeps working
+        # link fix in the task (like systems/subidea.sh, but whole-name matches only)      not in the moved folder, 4 log or pruned folders
+        task = os.path.dirname(dest)
+        fixed = 0
+        for cur, subs, files in os.walk(task):
+            subs[:] = [s for s in subs if not s.startswith(('.', '4 log')) and s not in PRUNE
+                       and os.path.join(cur, s) != dest and not os.path.islink(os.path.join(cur, s))]
+            for fn in files:
+                if fn.endswith(('.md', '.txt')):
+                    p = os.path.join(cur, fn)
+                    try:
+                        t = read(p)
+                    except (OSError, UnicodeDecodeError):
+                        continue
+                    n = pat.sub(newbase, t)
+                    if n != t and self.edit(p, n):
+                        fixed += 1
+        out.append(f'relegated {base} → {newbase} (files with links fixed: {fixed})')
+        fixed_links, unfixed_links = self.external_links(node, dest, task)
+        for p, before, after in fixed_links:
+            out.append(f'external link fixed: {p}: {before} → {after}')
+        for p, before, why in unfixed_links:
+            out.append(f'external link not fixed: {p}: {before} ({why})')
+        return '\n'.join(out)
+
+    def external_links(self, old, new, skip):
+        """every reference to old in md files of the topic folders outside skip (absolute, root-relative,
+        file-relative or markdown link, encoded or not): repaired where this action may edit the file, and
+        reported one by one either way. Notes/ is raymond's own writing: listed, never edited"""
+        old_abs, new_abs = os.path.abspath(old), os.path.abspath(new)
+        old_rel, new_rel = rel(self.root, old_abs), rel(self.root, new_abs)
+        end = r'(?=/|[\s)\]>"\'`]|$)'
+        tail_re = re.compile(r'[^\s)\]>"\'`]*')
+
+        def moved_target(target, folder):
+            if re.match(r'^[a-zA-Z][\w+.-]*:', target) or target.startswith('#'):
+                return None
+            raw = urllib.parse.unquote(target)
+            encoded = '%20' in target
+            def shaped(path):
+                return path.replace(' ', '%20') if encoded else path
+            for base, repl in ((old_abs, new_abs), (old_rel, new_rel)):
+                if raw == base or raw.startswith(base + '/'):
+                    return shaped(repl + raw[len(base):])
+            if raw.startswith('/'):
+                return None
+            resolved = os.path.normpath(os.path.join(folder, raw))
+            if resolved == old_abs or resolved.startswith(old_abs + os.sep):
+                return shaped(os.path.relpath(new_abs + resolved[len(old_abs):], folder))
+            return None
+
+        def references(text, folder):
+            """(start, end, original, replacement) for each reference to old, non-overlapping"""
+            refs = []
+            for m in re.finditer(r'\]\(<?([^)>\n]+?)>?\)', text):
+                after = moved_target(m.group(1), folder)
+                if after is not None:
+                    refs.append((m.start(1), m.end(1), m.group(1), after))
+            local = os.path.relpath(old_abs, folder)
+            forms = [(re.escape(old_abs) + end, new_abs),
+                     (r'(?<![\w/.-])' + re.escape(old_rel) + end, new_rel),
+                     (r'(?<![\w/.-])(?:\./)?' + re.escape(local) + end, os.path.relpath(new_abs, folder)),
+                     (r'(?<![\w/.-])(?:\./)?' + re.escape(local.replace(' ', '%20')) + end,
+                      os.path.relpath(new_abs, folder).replace(' ', '%20'))]
+            for pattern, repl in forms:
+                for m in re.finditer(pattern, text):
+                    if any(a < m.end() and m.start() < b for a, b, _, _ in refs):
+                        continue
+                    tail = tail_re.match(text, m.end()).group(0)
+                    prefix = './' if m.group(0).startswith('./') else ''
+                    refs.append((m.start(), m.end() + len(tail), m.group(0) + tail, prefix + repl + tail))
+            return sorted(refs)
+
+        fixed, unfixed = [], []
+        for topic in TOPICS + ('Notes',):
+            for cur, subs, files in os.walk(os.path.join(self.root, topic)):
+                subs[:] = sorted(s for s in subs if not s.startswith(('.', '4 log')) and s not in PRUNE
+                                 and not os.path.islink(os.path.join(cur, s))
+                                 and os.path.abspath(os.path.join(cur, s)) not in (os.path.abspath(skip), new_abs))
+                for fn in sorted(files):
+                    if not fn.endswith('.md'):
+                        continue
+                    p = os.path.join(cur, fn)
+                    try:
+                        text = read(p)
+                    except (OSError, UnicodeDecodeError):
+                        continue
+                    refs = references(text, cur)
+                    if not refs:
+                        continue
+                    why = 'personal folder Notes/, never edited' if topic == 'Notes' else None
+                    if why is None:
+                        try:
+                            from agent_core import guard_path
+                            guard_path(self.root, p)
+                        except ImportError:
+                            pass
+                        except Exception as e:
+                            why = str(e)
+                    if why is None and self.commit_on and not self.include_dirty and tracked(self.root, p) and \
+                            git(self.root, 'status', '--porcelain', '--', rel(self.root, p), check=False).stdout.strip():
+                        why = 'uncommitted edits'
+                    shown = rel(self.root, p)
+                    if why:
+                        unfixed += [(shown, before, why) for _, _, before, _ in refs]
+                        continue
+                    updated, last = '', 0
+                    for start, stop, before, after in refs:
+                        updated += text[last:start] + after
+                        last = stop
+                    updated += text[last:]
+                    self.edit(p, updated)
+                    left = references(updated, cur)
+                    fixed += [(shown, before, after) for _, _, before, after in refs]
+                    unfixed += [(shown, before, 'unrecognized link form, still points at the old path') for _, _, before, _ in left]
+        return fixed, unfixed
+
+    def rotate(self, task, session=None):
+        f = note_file(task)
+        t = read(f)
+        old = fm_get(t, 'session', '') or '—'
+        status = clean(fm_get(t, 'status') or row_summary(packet_lines(t), 'status') or '')
+        lg = self.log_append(task, 'sessions.md', 'sessions (ctx rotate, newest last, old chats are never reloaded)',
+                             f'    {now()}      rotated      old session {clean(old)}      status {status[:120]}')
+        self.edit(f, fm_set(t, session=session or '', rotated=now()))
+        return f'rotated {rel(self.root, task)} (old session {old} logged in {rel(self.root, lg)})'
+
+    def send(self, target, text, sender):
+        text = clean(text)
+        if not text:
+            raise CtxError('empty message')
+        f = note_file(target)
+        t = read(f)
+        row = f'    q {now()} from {clean(sender)} → {os.path.basename(target)}{GAP}{text}\n        a\n'
+        m = re.search(r'```notes\ninbox[^\n]*\n(.*?)```', t, re.S)
+        if m:
+            t = t[:m.end(1)] + row + t[m.end(1):]
+        else:
+            t = t.rstrip('\n') + '\n\n```notes\ninbox (others append here      owner answers on the a row, folds it in, git keeps the old)\n' + row + '```\n'
+        self.edit(f, t)
+        return f'sent to {rel(self.root, f)} inbox: {text}'
+
+
+# ---------- read-only views ----------
+
+def boot_pack(root, task, max_chars=0):
+    task = task_of(root, task)
+    f0 = os.path.join(task, '0 start.md')
+    parts = [f'# boot pack · {rel(root, task)} · ctx boot {now()}',
+             'files + git are the memory      this pack = 0 start + pinned notes in full + inbox      everything else: read on demand',
+             f'## {rel(root, f0)}', read(f0).rstrip()]
+    own = walk_nodes(root, task, own_only=True)[1:]
+    for n in own:
+        if n['carry'] == 'pin':
+            parts += [f'## pinned · {n["path"]}', read(note_file(os.path.join(root, n['path']))).rstrip()]
+    dropped = [n['path'] for n in own if n['carry'] == 'drop' or n['kind'] == 'dead']
+    if dropped:
+        parts.append('## dropped (not loaded): ' + ' · '.join(dropped))
+    out = '\n\n'.join(parts) + '\n'
+    if max_chars and len(out) > max_chars:
+        note = f'\n… boot pack cut at {max_chars} of {len(out)} chars      read {rel(root, f0)} in full\n'
+        out = out[:max(0, max_chars - len(note))] + note
+    return out
+
+
+def board(root, scope):
+    beats = load_beats(root)
+    rows = []
+    for n in walk_nodes(root, scope):
+        if n['kind'] == 'agent' or n['owner']:
+            b = beats.get(n['path'], {})
+            n['heartbeat'] = b.get('heartbeat', '')
+            n['session'] = b.get('session', '')
+            n['harness'] = b.get('harness', '')
+            n['event'] = b.get('event', '')
+            rows.append(n)
+    return rows
+
+
+def age(ts):
+    try:
+        t = dt.datetime.strptime(ts, '%Y-%m-%d %H:%M')
+    except (TypeError, ValueError):
+        return '—'
+    m = int((dt.datetime.now() - t).total_seconds() // 60)
+    return f'{m}m' if m < 120 else f'{m // 60}h' if m < 2880 else f'{m // 1440}d'
+
+
+def beat(root, task, session=None, harness=None, event=None, extra=None):
+    task = task_of(root, task)
+    k = rel(root, task)
+    stamp = now()
+
+    def fn(b):
+        cur = b.setdefault(k, {})
+        cur['heartbeat'] = stamp
+        for key, v in (('session', session), ('harness', harness), ('event', event)):
+            if v:
+                cur[key] = v
+        cur.update(extra or {})
+
+    update_beats(root, fn)
+    return f'beat {k} {stamp}'
+
+
+# ---------- cli ----------
+
+MUTATING = {'pin', 'drop', 'auto', 'merge-up', 'relegate', 'rotate', 'send', 'set'}
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    ap = argparse.ArgumentParser(prog='ctx', description='idea-tree engine: files + git only, nothing deleted')
+    ap.add_argument('--root')
+    ap.add_argument('--no-commit', action='store_true')
+    ap.add_argument('--include-dirty', action='store_true')
+    ap.add_argument('--trailer', action='append', default=[])
+    # Delegate before the legacy subparser consumes flags such as system --help.
+    first = 0
+    while first < len(argv):
+        flag = argv[first]
+        if flag in ('--root', '--trailer'):
+            first += 2
+        elif flag in ('--no-commit', '--include-dirty') or flag.startswith(('--root=', '--trailer=')):
+            first += 1
+        else:
+            break
+    if first < len(argv) and argv[first] == 'system':
+        options = ap.parse_args(argv[:first])
+        from agent_core import main as system_main
+        return system_main(argv[first + 1:], root=find_root(options.root), commit=not options.no_commit)
+    sp = ap.add_subparsers(dest='cmd', required=True)
+    s = sp.add_parser('system', add_help=False, help='owned tasks, durable runs, sources, evidence and recovery')
+    s.add_argument('system_args', nargs=argparse.REMAINDER)
+    for c in ('tree', 'board'):
+        s = sp.add_parser(c)
+        s.add_argument('scope', nargs='?', default='Context')
+        s.add_argument('--json', action='store_true')
+    s = sp.add_parser('boot')
+    s.add_argument('task')
+    s.add_argument('--max-chars', type=int, default=0)
+    for c in ('pin', 'drop'):
+        s = sp.add_parser(c)
+        s.add_argument('note')
+        s.add_argument('--text')
+    s = sp.add_parser('auto')
+    s.add_argument('note')
+    s = sp.add_parser('merge-up')
+    s.add_argument('note')
+    s.add_argument('--text')
+    s = sp.add_parser('relegate')
+    s.add_argument('note')
+    s.add_argument('--dead', action='store_true')
+    s.add_argument('--no-merge', action='store_true')
+    s = sp.add_parser('rotate')
+    s.add_argument('task')
+    s.add_argument('--session')
+    s = sp.add_parser('send')
+    s.add_argument('task')
+    s.add_argument('text')
+    s.add_argument('--from', dest='sender', default=os.environ.get('CTX_FROM', 'raymond'))
+    s = sp.add_parser('set')
+    s.add_argument('note')
+    s.add_argument('pairs', nargs='+')
+    s = sp.add_parser('beat')
+    s.add_argument('task')
+    for k in ('session', 'harness', 'event', 'status', 'next'):
+        s.add_argument('--' + k)
+    a = ap.parse_args(argv)
+    root = find_root(a.root)
+    try:
+        if a.cmd == 'system':
+            from agent_core import main as system_main
+            return system_main(a.system_args, root=root, commit=not a.no_commit)
+        if a.cmd in ('tree', 'board'):
+            scope = resolve(root, a.scope)
+            rows = walk_nodes(root, scope) if a.cmd == 'tree' else board(root, scope)
+            if a.json:
+                print(json.dumps(rows, ensure_ascii=False, separators=(',', ':')))
+            elif a.cmd == 'tree':
+                for n in rows:
+                    mark = {'pin': '★ ', 'drop': '✕ '}.get(n['carry'], '  ')
+                    print('    ' * n['depth'] + mark + n['name'] + (GAP + n['status'][:70] if n['status'] else ''))
+            else:
+                for n in rows:
+                    print(f"{n['name']:<32}{age(n['heartbeat']):>6}  {n['status'][:60]:<62}{'needs you ' + str(n['needs_you']) if n['needs_you'] else ''}")
+            return 0
+        if a.cmd == 'boot':
+            task = resolve(root, a.task)
+            if os.path.isfile(os.path.join(task, 'systems', 'task.json')):
+                from agent_core import make_boot
+                pack = make_boot(root, task, a.max_chars or 9500)
+                sys.stdout.write(pack['text'])
+                return 2 if pack['manifest']['blocked'] else 0
+            sys.stdout.write(boot_pack(root, resolve(root, a.task), a.max_chars))
+            return 0
+        if a.cmd == 'send':
+            target = task_of(root, resolve(root, a.task))
+            if os.path.isfile(os.path.join(target, 'systems', 'task.json')):
+                from agent_core import Store
+                receipt = Store(root, commit=not a.no_commit).send(target, 'question', a.sender, clean(a.text))
+                print(json.dumps(receipt, indent=2, ensure_ascii=False))
+                return 0
+        ctx = Ctx(root, commit=not a.no_commit, trailers=a.trailer, include_dirty=a.include_dirty)
+        with flock(lock_path(root)):
+            pending = recover_legacy(root)
+            conflicts = [r for r in pending if r['phase'] in ('conflict', 'corrupt')]
+            if conflicts:
+                raise CtxError('unresolved interrupted ctx operation: ' + ', '.join(
+                    r['operation_id'] + (f' (corrupt record, {r["repair"]})' if r['phase'] == 'corrupt' else '')
+                    for r in conflicts))
+            try:
+                if a.cmd == 'beat':
+                    task = task_of(root, resolve(root, a.task))
+                    print(beat(root, task, a.session, a.harness, a.event))
+                    kv = {k: v for k, v in (('status', a.status), ('next', a.next)) if v}
+                    if not kv:
+                        return 0
+                    ctx.set_fields(task, **kv)
+                    r, msg = rel(root, task), 'frontmatter ' + ' · '.join(f'{k}: {v}' for k, v in kv.items())
+                else:
+                    node = resolve(root, getattr(a, 'note', None) or a.task)
+                    r = rel(root, node)
+                    if a.cmd in ('pin', 'drop', 'auto'):
+                        msg = ctx.carry(node, a.cmd, getattr(a, 'text', None))
+                    elif a.cmd == 'merge-up':
+                        msg = ctx.merge_up(node, a.text)[1]
+                    elif a.cmd == 'relegate':
+                        msg = ctx.relegate(node, a.dead, not a.no_merge)
+                    elif a.cmd == 'rotate':
+                        msg = ctx.rotate(task_of(root, node), a.session)
+                    elif a.cmd == 'send':
+                        msg = ctx.send(task_of(root, node), a.text, a.sender)
+                    else:  # set
+                        kv = {}
+                        for pair in a.pairs:
+                            if '=' not in pair:
+                                raise CtxError(f'expected key=value: {pair}')
+                            k, v = pair.split('=', 1)
+                            if not FM_KEY.match(k.strip() + ':'):
+                                raise CtxError(f'bad key: {k}')
+                            kv[k.strip()] = v.strip()
+                        f = ctx.set_fields(node, **kv)
+                        msg = f'{rel(root, f)} ' + ' · '.join(f'{k}: {v}' for k, v in kv.items())
+                h = ctx.commit(f'ctx {a.cmd}: {r}\n\n{msg}')
+                print(msg)
+            except Exception:
+                notes = ctx.rollback()
+                if notes:
+                    print('ctx: rollback left: ' + ' | '.join(notes), file=sys.stderr)
+                raise
+        print(f'commit {h}' if h else ('no commit (--no-commit or not a git repo)' if not ctx.commit_on else 'no change'))
+        if a.cmd == 'relegate':
+            relocated = os.path.join(os.path.dirname(node), ('d ' if a.dead else 'o ') + os.path.basename(node)[2:])
+            if os.path.isfile(os.path.join(relocated, 'systems', 'task.json')):
+                from agent_core import Store
+                try:
+                    receipt = Store(root, commit=not a.no_commit).reconcile_location(relocated, owner_token=os.environ.get('CTX_OWNER_TOKEN'))
+                    print('task identity and owned links reconciled: ' + receipt['task_id'])
+                except Exception as e:
+                    raise CtxError(f'folder move committed, task record repair required: {e}') from e
+        if a.cmd == 'rotate':
+            if os.path.isfile(os.path.join(task_of(root, node), 'systems', 'task.json')):
+                from agent_core import Store
+                Store(root, commit=not a.no_commit).release(task_of(root, node), os.environ.get('CTX_RUN'),
+                    os.environ.get('CTX_ACTOR'), os.environ.get('CTX_RUN_TOKEN'), reason='rotation packet ready, launch deferred')
+            task = task_of(root, node)
+            if os.path.isfile(os.path.join(task, 'systems', 'task.json')):
+                from agent_core import make_boot
+                sys.stdout.write('\n' + make_boot(root, task)['text'])
+            else:
+                sys.stdout.write('\n' + boot_pack(root, task))
+        return 0
+    except (CtxError, ValueError, RuntimeError) as e:
+        print(f'ctx: {e}', file=sys.stderr)
+        return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main())

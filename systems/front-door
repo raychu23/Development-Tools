@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""front-door: one read-only view for Raymond      what needs him · stalled/overlap · in flight · just done
+
+    python3 systems/front-door [--root R] [--json] [--done N]
+
+needs you      a `needs-you` row in any task's 0 start.md · blocked ledger tasks · unacknowledged engine questions
+flags          ledger board stalled / overlap flags (live tasks only)
+in flight      ledger tasks running → integrated
+done           the N most recently updated done ledger tasks, with the packet path
+Reads only. A malformed packet is skipped, never fatal. The Claude Code mod bots-front-door draws this JSON.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import sys
+
+sys.dont_write_bytecode = True
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def load(name):
+    spec = importlib.util.spec_from_loader(name, importlib.machinery.SourceFileLoader(name, os.path.join(HERE, name)))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+ledger = load('ledger')
+ctx = ledger.ctx
+LIVE = ('running', 'submitted', 'verified', 'integrated')
+
+
+def packet_needs(root):
+    """(task, why) for every `needs-you` row, first segment, in any live 0 start.md (done/failed packets are history)"""
+    out = []
+    for cur, dirs, files in os.walk(root):
+        dirs[:] = sorted(x for x in dirs if x not in ctx.PRUNE and not x.startswith('.'))
+        if '0 start.md' not in files:
+            continue
+        try:
+            text = ctx.read(os.path.join(cur, '0 start.md'))
+        except (OSError, UnicodeDecodeError):
+            continue
+        if ctx.fm_items(text).get('state') in ('done', 'failed'):
+            continue
+        for line in text.splitlines():
+            m = re.match(r'^ {4}needs-you {2,}(\S.*)$', line)
+            if m:
+                why = ledger.first_segment(m.group(1))
+                if why and not ledger.PLACEHOLDER.match(why):
+                    out.append({'task': ctx.rel(root, cur), 'why': why, 'source': 'packet'})
+    return out
+
+
+def engine_needs(root, errors):
+    """unacknowledged question messages in enrolled tasks (skipped when the engine is not installed here)"""
+    try:
+        sys.path.insert(0, HERE)
+        from agent_core import Store
+    except ImportError:
+        return []
+    try:
+        rows = Store(root, commit=False).board()
+    except Exception as e:  # reported, never silently empty
+        errors.append(f'engine inbox unreadable: {type(e).__name__}: {e}'[:300])
+        return []
+    return [{'task': r['path'], 'why': f"{r['needs_you']} unanswered question(s) in the task inbox", 'source': 'engine'}
+            for r in rows if r.get('needs_you')]
+
+
+def blocked_cause(root, task):
+    try:
+        text = ctx.read(os.path.join(root, task, '0 start.md'))
+    except (OSError, UnicodeDecodeError):
+        return ''
+    m = re.search(r'cause: ([^·\n]+)', text)
+    return m.group(1).strip() if m else ''
+
+
+def build(root, done=5):
+    errors = []
+    rows = ledger.scan(root, root)
+    needs = packet_needs(root) + engine_needs(root, errors)
+    for r in rows:
+        if r['state'] == 'blocked':
+            needs.append({'task': r['task'], 'why': 'blocked: ' + (blocked_cause(root, r['task']) or r['next'] or 'decision owner unblocks'),
+                          'source': 'ledger'})
+    seen, unique = set(), []
+    for n in needs:
+        key = (n['task'], n['why'])
+        if key not in seen:
+            seen.add(key)
+            unique.append(n)
+    finished = sorted((r for r in rows if r['state'] == 'done'), key=lambda r: r['updated'], reverse=True)[:done]
+    return {
+        'needs_you': unique,
+        'tasks_needing_you': len({n['task'] for n in unique}),
+        'errors': errors,
+        'flags': [{'task': r['task'], 'flag': f} for r in rows for f in r['flags']],
+        'in_flight': [{k: r[k] for k in ('task', 'state', 'owner', 'updated', 'next')} for r in rows if r['state'] in LIVE],
+        'done': [{'task': r['task'], 'updated': r['updated'], 'path': os.path.join(root, r['task'], '0 start.md')} for r in finished],
+    }
+
+
+def text(view):
+    lines = ['```notes', 'front door']
+    lines += [f'    error      {e}' for e in view['errors']]
+    if view['needs_you']:
+        lines.append('    needs you')
+        lines += [f"        {n['task']}      {n['why']}" for n in view['needs_you']]
+    else:
+        lines.append('    nothing needs you')
+    if view['flags']:
+        lines.append('    flags')
+        lines += [f"        {f['task']}      {f['flag']}" for f in view['flags']]
+    lines.append('    in flight' if view['in_flight'] else '    nothing in flight')
+    lines += [f"        {r['task']}      {r['state']}      {r['owner']}" for r in view['in_flight']]
+    if view['done']:
+        lines.append('    just done')
+        lines += [f"        {d['task']}      {d['updated']}" for d in view['done']]
+    lines.append('```')
+    return '\n'.join(l.replace(';', ',') for l in lines) + '\n'  # notes style: no semicolons
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description='read-only front door: needs you, flags, in flight, done')
+    p.add_argument('--root')
+    p.add_argument('--json', action='store_true')
+    p.add_argument('--done', type=int, default=5)
+    a = p.parse_args(argv)
+    if a.done < 0:
+        p.error('--done must be 0 or more')
+    root = ctx.find_root(a.root)
+    view = build(root, a.done)
+    sys.stdout.write(json.dumps(view, ensure_ascii=False) + '\n' if a.json else text(view))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

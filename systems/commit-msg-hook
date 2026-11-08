@@ -1,0 +1,14 @@
+#!/bin/sh
+# commit-msg hook: provenance trailers on every commit an agent makes (T18 q17)      installed by systems/sync.sh as .git/hooks/commit-msg
+#   Assisted-by: <harness>      Chat: <session id>      only when the harness env is present (raymond's own commits get nothing)
+#   Source: <url or path> stays manual: add it to the message when content came from outside
+MSG="$1"
+H=""; S=""
+if [ -n "${HERMES_SESSION_ID-}" ]; then H="hermes"; S="$HERMES_SESSION_ID"
+elif [ -n "${CLAUDECODE-}" ] || [ -n "${CLAUDE_CODE_SESSION_ID-}" ]; then H="claude-code"; S="${CLAUDE_CODE_SESSION_ID-}"
+elif [ -n "${CODEX_THREAD_ID-}" ] || [ -n "${CODEX_SESSION_ID-}" ]; then H="codex"; S="${CODEX_THREAD_ID:-${CODEX_SESSION_ID-}}"
+fi
+[ -z "$H" ] && exit 0
+grep -q '^Assisted-by:' "$MSG" || git interpret-trailers --in-place --if-exists doNothing --trailer "Assisted-by: $H" "$MSG"
+[ -n "$S" ] && { grep -q '^Chat:' "$MSG" || git interpret-trailers --in-place --if-exists doNothing --trailer "Chat: $S" "$MSG"; }
+exit 0

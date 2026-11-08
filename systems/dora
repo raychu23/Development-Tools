@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""dora: DORA-style health of the agent system (T18 q18)      change volume + rework on skills, rules, hooks
+
+    python3 systems/dora [--days 30] [--json Context/systems/dora.json]
+
+change      a commit touching skills/ · systems/ · rules/ · rules.md · AGENTS.md · Context/1 takeaways.md
+rework      a change to a file that was changed ≤7 days before by a different commit whose message says fix / again / revert / correct / redo
+            (= DORA rework rate: unplanned work to repair a recent change)
+fail        a commit message with revert / broke / regression / undo      (= change fail rate)
+per file    top files by rework → candidates for a check instead of more text (poteto /correct)
+"""
+import argparse
+import json
+import re
+import subprocess
+import sys
+import time
+from collections import Counter, defaultdict
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+ROOT = Path(__file__).resolve().parent.parent
+PATHS = ['skills', 'systems', 'rules', 'rules.md', 'AGENTS.md', 'Context/1 takeaways.md']
+REWORK = re.compile(r'\b(fix|fixes|fixed|again|revert|correct|correction|redo|repair|review fixes?)\b(?!-)', re.I)
+FAIL = re.compile(r'\b(revert|broke|broken|regression|undo)\b', re.I)
+WINDOW = 7 * 86400
+
+
+def commits(root, days):
+    out = subprocess.run(['git', '-C', str(root), 'log', '--no-merges', f'--since={days} days ago', '--format=%x1e%h%x1f%ct%x1f%s',
+                          '--name-only', '--', *PATHS], capture_output=True, text=True).stdout
+    rows = []
+    for chunk in out.split('\x1e')[1:]:
+        head, *files = chunk.strip('\n').split('\n')
+        h, ct, s = head.split('\x1f', 2)
+        rows.append({'hash': h, 'ts': int(ct), 'subject': s, 'files': [f for f in files if f]})
+    return sorted(rows, key=lambda r: r['ts'])
+
+
+def measure(rows):
+    last = {}
+    rework, by_file = [], Counter()
+    for r in rows:
+        hit = False
+        if REWORK.search(r['subject']):
+            for f in r['files']:
+                if f in last and r['ts'] - last[f] <= WINDOW:
+                    by_file[f] += 1
+                    hit = True
+        if hit:
+            rework.append(r['hash'])
+        for f in r['files']:
+            last[f] = r['ts']
+    weeks = defaultdict(int)
+    for r in rows:
+        weeks[time.strftime('%G-W%V', time.localtime(r['ts']))] += 1
+    n = len(rows)
+    return {'changes': n, 'per_week': dict(sorted(weeks.items())), 'rework': len(rework),
+            'rework_rate': round(len(rework) / n, 3) if n else 0.0,
+            'fail': sum(1 for r in rows if FAIL.search(r['subject'])),
+            'change_fail_rate': round(sum(1 for r in rows if FAIL.search(r['subject'])) / n, 3) if n else 0.0,
+            'top_rework_files': by_file.most_common(8)}
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+    ap.add_argument('--days', type=int, default=30); ap.add_argument('--json'); ap.add_argument('--root', default=str(ROOT))
+    a = ap.parse_args(argv)
+    m = measure(commits(a.root, a.days))
+    m.update(days=a.days, built=time.strftime('%Y-%m-%dT%H:%M:%S%z'))
+    print(f"last {a.days}d: {m['changes']} system changes · rework {m['rework']} ({m['rework_rate']:.0%}) · change-fail {m['fail']} ({m['change_fail_rate']:.0%})")
+    for f, c in m['top_rework_files']:
+        print(f'    {c:3}  {f}')
+    if a.json:
+        Path(a.root, a.json).write_text(json.dumps(m, indent=1) + '\n')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

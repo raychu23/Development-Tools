@@ -1,0 +1,6 @@
+interface:
+  display_name: "Evidence-First Planning"
+  short_description: "Check assumptions and alternatives before recommending"
+  default_prompt: "Use $evidence-first-planning to evaluate this decision against my constraints, verify decisive claims and alternatives, and recommend a path with explicit uncertainty."
+policy:
+  allow_implicit_invocation: true

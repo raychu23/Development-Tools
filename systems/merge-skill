@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""merge-skill: 3-way merge of 2 versions of a skill / text file, best of each kept (T18 q19, raymond: "merge keep what makes sense")
+
+    python3 systems/merge-skill <ours> <theirs> --base <file>                  base = common ancestor file
+    python3 systems/merge-skill <ours> <theirs> --repo <dir> --commit <sha> --path <path in repo>   base from the locked upstream commit
+    python3 systems/merge-skill <ours> <theirs>                                no base → 2-way: every difference is a conflict
+    → <ours>.merged (git merge-file --zdiff3, conflict hunks marked)      prints clean / conflict counts      then the merge-files skill resolves each hunk
+"""
+import argparse
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+
+
+def base_text(a):
+    """bytes (keeps CRLF exactly)"""
+    if a.base:
+        return Path(a.base).read_bytes()
+    if a.repo and a.commit and a.path:
+        r = subprocess.run(['git', '-C', a.repo, 'show', f'{a.commit}:{a.path}'], capture_output=True)
+        if r.returncode == 0:
+            return r.stdout
+        print(f'base not found at {a.commit}:{a.path} (shallow clone? git -C <repo> fetch --unshallow) → 2-way', file=sys.stderr)
+    return b''
+
+
+def merge(ours, theirs, base, out):
+    with tempfile.TemporaryDirectory() as d:
+        b = Path(d) / 'base'; b.write_bytes(base.encode() if isinstance(base, str) else base)
+        r = subprocess.run(['git', 'merge-file', '-p', '--zdiff3', '-L', f'ours ({ours})', '-L', 'base (upstream at lock)',
+                            '-L', f'theirs ({theirs})', str(ours), str(b), str(theirs)], capture_output=True)
+    if r.returncode < 0 or r.returncode > 127:
+        raise SystemExit(r.stderr.decode(errors='replace'))
+    Path(out).write_bytes(r.stdout)
+    return r.stdout.count(b'\n<<<<<<< ') + (1 if r.stdout.startswith(b'<<<<<<< ') else 0)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+    ap.add_argument('ours'); ap.add_argument('theirs')
+    ap.add_argument('--base'); ap.add_argument('--repo'); ap.add_argument('--commit'); ap.add_argument('--path')
+    ap.add_argument('--out')
+    a = ap.parse_args(argv)
+    out = a.out or a.ours + '.merged'
+    n = merge(a.ours, a.theirs, base_text(a), out)
+    print(f'{out}: {"clean merge" if n == 0 else f"{n} conflict hunk(s) to resolve (merge-files skill)"}')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

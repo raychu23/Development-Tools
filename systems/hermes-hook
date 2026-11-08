@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""hermes-hook: the same core claude code + codex get from ctx-hook --native, for hermes (T18 T1-core-layer, opp 1 + 2)
+
+    wired in ~/.hermes/config.yaml  hooks:
+        pre_llm_call          python3 "<CS Code>/systems/hermes-hook" --root "<CS Code>"
+        on_session_finalize   same command
+
+    pre_llm_call, first turn      §1 core + task boot pack (or routing board)      = claude/codex session-start
+    pre_llm_call, every turn      complaint detect → Context/systems/complaint inbox.jsonl (harness=hermes) + reminder
+    on_session_finalize           release the native writer grant
+    out                           stdout {"context": "..."}  → hermes adds it to the user message (never the system prompt)
+
+why pre_llm_call: hermes ignores what an on_session_start hook prints, pre_llm_call output is injected (agent/turn_context.py)
+cwd: hermes sends the gateway process cwd (home on desktop), so the session's own cwd is read from ~/.hermes/state.db
+outside CS Code (and not home) → prints nothing, like ctx-hook. a hook must never break the session: every error → exit 0
+"""
+import json
+import os
+import re
+import sqlite3
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)
+HARNESS = 'hermes'
+AGENT_PLATFORMS = {'subagent', 'cron'}
+FOLDERS = 'Context/context-and-skills/systems/hermes session folders.json'
+WRITE_TOOLS = {'write_file', 'patch'}
+
+
+def session_cwd(session_id, fallback):
+    """the hermes session's own cwd from state.db (read-only)      fallback = payload cwd"""
+    db = Path(os.environ.get('HERMES_HOME') or Path.home() / '.hermes') / 'state.db'
+    if session_id and db.exists():
+        try:
+            con = sqlite3.connect(f'file:{db}?mode=ro', uri=True, timeout=2)
+            try:
+                row = con.execute('select cwd from sessions where id = ?', (session_id,)).fetchone()
+            finally:
+                con.close()
+            if row and row[0]:
+                return row[0]
+        except sqlite3.Error:
+            pass
+    return fallback
+
+
+def message_text(msg):
+    """user_message may be a string or a list of content parts"""
+    if isinstance(msg, str):
+        return msg
+    if isinstance(msg, list):
+        return '\n'.join(p.get('text', '') if isinstance(p, dict) else str(p) for p in msg)
+    return str(msg or '')
+
+
+def translate(payload):
+    """hermes payload → the dict handle_hook / ground_truth expect"""
+    extra = payload.get('extra') or {}
+    sid = str(payload.get('session_id') or extra.get('session_id') or '')
+    return {
+        'session_id': sid,
+        'cwd': session_cwd(sid, payload.get('cwd') or os.getcwd()),
+        'prompt': message_text(extra.get('user_message')),
+        'first': bool(extra.get('is_first_turn')),
+    }
+
+
+def tool_calls(msgs):
+    """[(name, args dict)] from openai-style assistant messages"""
+    out = []
+    for m in msgs:
+        if not isinstance(m, dict) or m.get('role') != 'assistant':
+            continue
+        for c in m.get('tool_calls') or []:
+            f = (c or {}).get('function') or {}
+            a = f.get('arguments')
+            if isinstance(a, str):
+                try:
+                    a = json.loads(a)
+                except ValueError:
+                    a = {'raw': a}
+            out.append((f.get('name') or '', a if isinstance(a, dict) else {}))
+    return out
+
+
+LEVEL = {'0 start.md', '1 takeaways.md', '2 insights.md', '3 workflow.md', 'doc.html'}
+TASK_DIR = re.compile(r'^T\d+[-_]')
+
+
+def is_level_file(path):
+    """a task's own save target: level files, doc page, 4 log"""
+    return os.path.basename(path) in LEVEL or '/4 log/' in path
+
+
+def owner_folder(root, path):
+    """repo-relative task folder (nearest T<n>-name ancestor) a changed path belongs to, '' when none"""
+    try:
+        rel = os.path.relpath(path, root) if os.path.isabs(path) else path
+    except ValueError:
+        return ''
+    if rel.startswith('..'):
+        return ''
+    parts = rel.split(os.sep)[:-1]
+    for i in range(len(parts), 0, -1):
+        if TASK_DIR.match(parts[i - 1]):
+            return os.sep.join(parts[:i])
+    return ''
+
+
+def save_nudge(root, session_id, history):
+    """end-of-turn sensor, checked at the start of the next turn: last turn changed files but the chat's
+    task folder got nothing → 1 line telling the agent to save first      '' when fine      never raises"""
+    try:
+        users = [i for i, m in enumerate(history) if isinstance(m, dict) and m.get('role') == 'user']
+        if not users:
+            return ''
+        end = users[-1]
+        start = users[-2] if len(users) > 1 else -1
+        if start < 0 and end == len(history) - 1:
+            return ''                   # first turn: nothing done yet
+        if start < 0 or history[end].get('content') is None:
+            start, end = end, len(history)  # history may not include the current message yet
+        calls = tool_calls(history[start + 1:end])
+        paths = [str(a.get('path') or '') for n, a in calls if n in WRITE_TOOLS]
+        cmds = [str(a.get('command') or a.get('code') or a.get('raw') or '') for n, a in calls if n not in WRITE_TOOLS]
+        changed = bool(paths) or any(k in c for c in cmds for k in ('git commit', 'write_text(', 'git mv', '.write('))
+        if not changed:
+            return ''
+        try:
+            folder = json.loads((Path(root) / FOLDERS).read_text()).get(session_id, '')
+        except (OSError, ValueError):
+            folder = ''
+        if not folder:
+            return ('Last turn changed files, but this chat has no task folder yet: map it (docs-over-chat §0, '
+                    f'{FOLDERS}) and save last turn\'s facts there before replying.')
+        # owner of each changed file = the task folder (T<n>-name) it sits in, else this chat's folder      raymond 10-19:
+        # "if it truly doesnt apply to t16 only t18 thats fine" → work in task X is saved when X got a level file
+        rel = os.path.relpath(folder, root) if folder.startswith(str(root)) else folder
+        saved, needed = set(), []
+        for p in paths:
+            own = owner_folder(root, p) or rel.rstrip('/')
+            if is_level_file(p):
+                saved.add(own)
+            elif own not in needed:
+                needed.append(own)
+        if not paths:
+            needed = [rel.rstrip('/')]
+        for c in cmds:
+            for own in list(needed):
+                if own + '/' in c or c.rstrip().endswith(own):
+                    saved.add(own)
+        missing = [o for o in needed if o not in saved]
+        if not missing:
+            return ''
+        return (f'Last turn changed files but wrote nothing to the task folder that owns them ({missing[0]}'
+                + (' · this chat is mapped to ' + rel if missing[0] != rel.rstrip('/') else '') + '): '
+                'save its facts there (0 start · 1 takeaways · 2 insights) before replying, or say why none apply.')
+    except Exception:
+        return ''
+
+
+def context_text(root, payload, registry=None):
+    """text to inject, '' for none"""
+    from native_activation import NativeRegistry, handle_hook
+    import ground_truth
+    event = payload.get('hook_event_name') or ''
+    data = translate(payload)
+    registry = registry or NativeRegistry(root)
+    if event == 'on_session_finalize':
+        registry.release(HARNESS, data['session_id'])
+        return ''
+    if event != 'pre_llm_call':
+        return ''
+    # delegated children + cron: the "user message" is an agent-written brief, never raymond
+    if str((payload.get('extra') or {}).get('platform') or '') in AGENT_PLATFORMS:
+        return ''
+    if data['first']:
+        out = handle_hook(registry, HARNESS, 'session-start', data)
+        if out is None:          # outside CS Code: untouched, no logging either
+            return ''
+        ground_truth.turn_reminder(root, data['session_id'])  # count turn 1
+        parts = [out['hookSpecificOutput'].get('additionalContext', ''), ground_truth.on_prompt(root, data, HARNESS)]
+    else:
+        # not handle_hook('prompt'): for an unbound session it re-sends the ~7k-char routing board every turn
+        pack = registry.boot(HARNESS, data)
+        if pack.get('ignored'):
+            return ''
+        history = (payload.get('extra') or {}).get('conversation_history') or []
+        parts = [pack['text'] if pack.get('task') and pack.get('changed') else '', ground_truth.on_prompt(root, data, HARNESS),
+                 ground_truth.turn_reminder(root, data['session_id']), save_nudge(root, data['session_id'], history)]
+    history = (payload.get('extra') or {}).get('conversation_history') or []
+    parts.append(stream_text(root, data, history))
+    return '\n\n'.join(p for p in parts if p)
+
+
+def stream_text(root, data, history):
+    """Mole sessions only: what other agents changed in the 7 active streams + route his message + save nudge
+    (Project/Mole/context/streams/hook_digest.py, 11-01)      never raises, '' outside Project/Mole"""
+    try:
+        d = os.path.join(root, 'Project/Mole/context/streams')
+        if not os.path.isdir(d):
+            return ''
+        sys.path.insert(0, d)
+        import hook_digest
+        return hook_digest.stream_text(root, data, history)
+    except Exception as e:
+        print(f'hermes-hook streams: {type(e).__name__}: {e}', file=sys.stderr)
+        return ''
+
+
+def main(argv):
+    try:
+        root = argv[argv.index('--root') + 1] if '--root' in argv else os.path.dirname(HERE)
+        payload = json.loads(sys.stdin.read() or '{}')
+        if not isinstance(payload, dict):
+            return 0
+        text = context_text(root, payload)
+        if text:
+            print(json.dumps({'context': text}))
+    except Exception as e:  # never break the session      visible on stderr (hermes logs it)
+        print(f'hermes-hook: {type(e).__name__}: {e}', file=sys.stderr)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))

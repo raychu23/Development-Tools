@@ -1,0 +1,96 @@
+/* doc-style.css — THE one design source for every CS Code doc.html (docs-over-chat skill).
+   Edit here, then run:  python3 "skills/all/system/docs-over-chat/scripts/doc_style.py"
+   It copies this file into every doc.html as the data-doc-style style block, last in head, so it wins.
+   Render scripts (render_docs.py) call the same tool after writing, so re-renders keep it.
+
+   Rules (raymond): tabs = TOP bar, never a left sidebar · warm dark palette · no big gaps.
+   Page markup it expects: <nav> with <a> or <button> tabs (.on = active) · <main> · <section>. */
+
+:root:root {
+  --ds-bg: #1a1714;      /* page */
+  --ds-bar: #110f0d;     /* top tab bar */
+  --ds-card: #241f1a;    /* cards, table heads */
+  --ds-code: #2b2622;    /* code, pre */
+  --ds-line: #5a4a35;    /* borders, dividers */
+  --ds-fg: #ece4d8;      /* text */
+  --ds-mut: #a8998a;     /* secondary text */
+  --ds-acc: #e0a84a;     /* accent, active tab, h2 */
+  --ds-font: 15px/1.55 -apple-system, system-ui, sans-serif;
+  --ds-mono: 12.5px/1.5 ui-monospace, Menlo, monospace;
+  /* map the per-doc token names onto the source palette */
+  --bg: var(--ds-bg); --fg: var(--ds-fg); --mut: var(--ds-mut); --line: var(--ds-line);
+  --card: var(--ds-card); --alt: var(--ds-bar); --acc: var(--ds-acc);
+  --code: var(--ds-code); --a: var(--ds-acc); --side: var(--ds-bar);
+}
+
+/* ---- page + top tab bar ---- */
+html body { display: block !important; margin: 0; background: var(--ds-bg); color: var(--ds-fg); font: var(--ds-font); min-height: 100vh; }
+html body > nav {
+  position: sticky !important; top: 0; z-index: 10;
+  width: auto !important; height: auto !important;
+  display: flex !important; flex-wrap: nowrap !important; align-items: center; gap: 4px;
+  overflow-x: auto; overflow-y: hidden; scrollbar-width: thin; /* 1 row, scroll sideways when narrow */
+  padding: 8px 16px !important; margin: 0;
+  background: var(--ds-bar) !important; border: 0 !important; border-bottom: 2px solid var(--ds-line) !important;
+  box-sizing: border-box;
+}
+html body > nav > b { flex: none; display: inline-block !important; margin: 0 10px 0 0 !important; color: var(--ds-mut); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
+html body > nav > a, html body > nav > button {
+  flex: none; display: inline-block !important; width: auto !important;
+  padding: 6px 12px !important; border: 0; border-radius: 8px;
+  background: none; color: var(--ds-fg) !important; font: inherit; text-decoration: none; cursor: pointer; white-space: nowrap;
+}
+html body > nav > a:hover, html body > nav > button:hover { background: var(--ds-card); }
+html body > nav > a.on, html body > nav > button.on { background: var(--ds-card) !important; color: var(--ds-acc) !important; }
+html body > main { display: block; max-width: 1100px !important; margin: 0; padding: 18px 26px 40px !important; box-sizing: border-box; }
+html body > main.wide { max-width: none !important; } /* opt-in for pages built around wide comparison tables */
+html body section { display: none; } html body section.on { display: block; }
+html body:not(:has(> nav)) section { display: block; } /* single-page docs */
+
+/* ---- text ---- */
+h1 { font-family: Georgia, serif; font-size: 28px; line-height: 1.2; margin: 4px 0 8px; }
+h2 { font-family: Georgia, serif; font-size: 20px; margin: 20px 0 8px; color: var(--ds-acc); }
+h3 { font-size: 16px; margin: 14px 0 6px; }
+p, ul, ol { margin: 4px 0 10px; } li { margin: 3px 0; }
+a { color: var(--ds-acc); }
+.meta, .log { color: var(--ds-mut); font-size: 13px; }
+
+/* ---- tables, code ---- */
+table { border-collapse: collapse; width: 100%; font-size: 14px; margin: 8px 0 14px; display: table; }
+th, td { border: 1px solid var(--ds-line); padding: 6px 9px; text-align: left; vertical-align: top; }
+th { background: var(--ds-card); }
+code { background: var(--ds-code); padding: 1px 5px; border-radius: 5px; font-size: 12.5px; }
+pre { background: var(--ds-bar); border: 1px solid var(--ds-line); border-radius: 10px; padding: 10px 12px; font: var(--ds-mono); overflow-x: auto; white-space: pre; }
+pre code { background: none; padding: 0; }
+
+/* latest strip (doc_style.recent): what changed most recently in this task, under the tab bar */
+html body > div[data-doc-recent] { display: flex; gap: 10px; align-items: baseline; margin: 6px auto 0; max-width: 1100px; padding: 6px 12px; border: 1px solid var(--ds-line, #444); border-radius: 8px; font-size: 12.5px; background: var(--ds-card); }
+html body > div[data-doc-recent] > span { flex: none; color: var(--ds-acc, #d9a35b); font-weight: 600; text-transform: uppercase; letter-spacing: .06em; }
+html body > div[data-doc-recent] ul { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 2px; }
+html body > div[data-doc-recent] li:first-child { font-weight: 600; }
+html body > div[data-doc-recent] b { color: var(--ds-mut); font-weight: 500; margin-right: 6px; }
+
+/* ---- status pills (.s and .tag): dark tint + light colored text, ALWAYS both set together ----
+   raymond 2026-11-03: pastel backgrounds (#d5ecd4 …) from a page's own CSS + this page's light body text = unreadable cream blobs.
+   Never set a pill background without its text color. Pick a state class; do not invent colors. */
+.s, .tag { display: inline-block; font: 600 12px/1.4 system-ui, sans-serif; padding: 1px 8px; border-radius: 8px; white-space: nowrap; margin-right: 4px;
+  background: #3a322a !important; color: var(--ds-fg) !important; }
+.s.done, .s.ok, .s.running, .tag.ok, .tag.done { background: #24361f !important; color: #7fbf7f !important; }
+.s.active, .tag.info { background: #1f2f3d !important; color: #7fb4e0 !important; }
+.s.blocked, .s.stale, .s.open, .tag.open, .tag.blocked { background: #3a221c !important; color: #e07a5f !important; }
+.s.unknown, .s.todo, .s.proposed, .s.wait, .tag.wait, .tag.todo { background: #3a3020 !important; color: var(--ds-acc) !important; }
+.small { color: var(--ds-mut) !important; } /* same lesson: a page's own #666 grey is unreadable on the dark page */
+
+/* ---- core block + folds: THE shared page-structure kit (raymond 2026-11-03: "i do like this core block + folding sections system, back it into the docs generation for anything") ----
+   Every multi-section page: 1 core block (<=7 lines, counts link to sections) then folded sections, never a wall of tables.
+   Build with doc_style.core / fold / fold_list / fold_bar; script is injected by doc_style.apply when the page uses them. */
+pre.core { white-space: pre-wrap; border-left: 3px solid var(--ds-acc); background: var(--ds-bar); line-height: 1.6; }
+details.fold { border: 1px solid var(--ds-line); border-radius: 10px; margin: 8px 0; background: var(--ds-card); }
+details.fold > summary { cursor: pointer; padding: 8px 12px; font-weight: 600; }
+details.fold > summary .sub { color: var(--ds-mut); font-weight: 400; }
+details.fold > .fold-body { padding: 2px 14px 10px; }
+details.fold details.fold { background: transparent; }
+details.fold.item > summary { font-weight: 500; }
+.ref { font: var(--ds-mono); color: var(--ds-acc); margin-right: 6px; white-space: nowrap; }
+.fold-bar { margin: 6px 0; } .fold-bar button { font: inherit; padding: 4px 10px; margin-right: 6px; border: 1px solid var(--ds-line); border-radius: 8px; background: var(--ds-card); color: var(--ds-fg); cursor: pointer; }
+input[data-filter] { width: 60%; padding: 6px 9px; margin: 6px 0; background: var(--ds-bar); color: var(--ds-fg); border: 1px solid var(--ds-line); border-radius: 8px; font: inherit; }

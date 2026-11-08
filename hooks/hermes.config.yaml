@@ -1,0 +1,11 @@
+hooks:
+  pre_llm_call:
+    - command: python3 "$WORKSPACE/systems/hermes-hook" --root "$WORKSPACE"
+      timeout: 20
+  on_session_finalize:
+    - command: python3 "$WORKSPACE/systems/hermes-hook" --root "$WORKSPACE"
+      timeout: 20
+  pre_tool_call:
+    - matcher: write_file|patch
+      command: python3 "$WORKSPACE/hooks/test-guard.py"
+      timeout: 10
